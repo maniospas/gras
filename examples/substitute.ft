@@ -1,0 +1,17 @@
+import ft.impl
+
+type nat: Impl::nat
+type pair
+    x:nat
+    y:nat
+return
+    x:nat
+    y:nat
+    x followedby y
+
+type Main
+    p1: pair
+where
+    r3 = Impl::add p1 // the difficulty is that the 'followedby' edge is different
+
+run Main
