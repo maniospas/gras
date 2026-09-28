@@ -998,7 +998,7 @@ def infer_editor(source:str,file:str='<editor>')->tuple[str,Error|None]:
         except Error: pass
         rendered=inferred_html(program,file,e); return rendered if 'error-card' in rendered else rendered+error_card(e),e
 
-def serve(initial:str='',title:str='GSlang',file:str='<editor>')->None:
+def serve(initial:str='',title:str='GraS',file:str='<editor>')->None:
     page=playground_document(initial,title).encode('utf-8')
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,fmt,*args)->None: return
