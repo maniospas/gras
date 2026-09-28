@@ -7,7 +7,7 @@
 *Disclaimer: The code has mostly been written by ChatGPT, with manual review, refinement, and testing. This is a re-implementation of the most significan parts of my PhD thesis some years after its conclusion. he rewrite helps frame obscure theoretical results and tools in simpler terms.*
 
 
-GS is a language for proofs using knowledge graph 
+GS is a language for proofs using labeled graph 
 substitutions; variables are nodes, and named relations 
 are labeled directed edges. There are subistitution rules 
 for "proving" programs, where the proof may also translate
@@ -15,7 +15,15 @@ to creating a runable pipeline. Do note that the proofs
 are logically consistent despite allowing abstract textual
 predicates in their definitions.
 
-## Universes
+## 🚀 Quickstert
+
+Clone this repository and run  `python gs.py --serve` to pen the interactive environment. Start writing your program.
+
+![examples/preview.png](examples/preview.png)
+
+## 📚 Short guide
+
+### Universes
 
 A universe is a namespace whose types can be accessed
 via `::`. You can skip the namespace access if already
@@ -31,7 +39,7 @@ def nat: Impl::nat
 ```
 
 
-## Types
+### Types
 
 A def declares a graph. Commas and parentheses are optional,
 but do prefer them when annotating in one line. The example
@@ -48,9 +56,15 @@ def nat: impl::nat // redeclare in this universe
 def pair(x: nat, y: nat, x followedby y)
 ```
 
-## Return Graphs
+### Return
 
 `return` turns a def a function and declares its returned graph.
+More details later, but importantly any inputs not found in the 
+outputs are DROPPED. By the way, variables unpack to their type's
+internals immediately. That is, `p: pair` unpacks into 
+`p.x: nat, p.y: nat, p.x followedby p.y`. Convesely, could use
+`p` to also gather all variables starting with `p.`. This intentionally
+looks and behaves similarly to structure access of other languages.
 
 ```python
 def keep_left(p: pair)
@@ -79,7 +93,7 @@ where ret=p.x
 ```
 
 
-## Where
+### Where
 
 `where` merges nodes between inputs and/or outputs, and
 uses functions to transform the input graph. It comprises
@@ -109,11 +123,14 @@ run main
 ```
 
 Functions substitutes subgraphs with one of the same node types
-and a compatible subset of edges. Positive relations are reinstated
-afterwords, whereas newlly disconnected graph components are 
-removed.
+and a compatible subset of edges. This is the exact mechanism:
+1. Match the nodes in the program's graph.
+2. Match a subset of edges of the induced program subgraph for matched nodes.
+3. Replace the induced subgraph with the substitution rule's outcome. This will partially match some inputs with some outputs, but may remove some nodes too (nodes and edges are consumed linearly by rule application).
+4. Remove all dangling disconnected subgraphs due to removed nodes.
+5. Reinstate relations between output nodes that are isomorhpic to those of the original induced subgraph but have *not* been considered by the input graph.
 
-Parentheses create temporary results automatically. The next example
+Parentheses create temporary substitutions automatically. The next example
 is equivalent to creating a temporary for `add x y` and passing
 that result to `mul`. Use `reduce` instead of `ret=` to not track
 the return with a variable. Newlines and commas end expressions
@@ -148,7 +165,7 @@ return(a: nat, b: nat)
 where a = b
 ```
 
-## Builtin functions
+### Builtins
 
 *Unorganized concepts about creating new builtin functions.*
 
@@ -177,36 +194,17 @@ b arg1 call
 ```
 
 
-## Keywords
+### Keyword summary
 
-The language recognizes these words as standalone keywords.
+The language recognizes the following keywords.
 
-``` text
+```text
+import
 universe
-type
+def
 return
 where
+run
 reduce
 all
-run
-import
-```
-
-## Example
-
-``` python
-import gs.impl
-
-def nat: Impl::nat
-def pair(x: nat, y: nat, x followedby y)
-def keep_left(p: pair) return p.a: nat
-
-def main(p1: pair, p2: pair, factor: nat)
-where
-    left = keep_left p1
-    right = keep_left p2
-    sum = Impl::add left right
-    result = Impl::mul sum factor
-
-run main
 ```
