@@ -1,17 +1,17 @@
-import ft.impl
+import gs.impl
 
-type nat: Impl::nat
-type pair
+def nat: Impl::nat
+def pair
     x:nat
     y:nat
 return
     x:nat
     y:nat
     x followedby y
-type keep_left  p:pair return p.a:nat
-type keep_right p:pair return p.b:nat
+def keep_left  p:pair return p.a:nat
+def keep_right p:pair return p.b:nat
 
-type Main
+def Main
     p1: pair
     p2: pair
     factor: nat

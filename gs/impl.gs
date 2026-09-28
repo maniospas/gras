@@ -1,7 +1,7 @@
 universe Impl
-type nat
+def nat
 
-type add(a: nat, b: nat)
+def add(a: nat, b: nat)
 return
     call: "add"
     a: nat
@@ -11,7 +11,7 @@ return
     a arg call
     b arg call
 
-type mul(a: nat, b: nat)
+def mul(a: nat, b: nat)
 return
     call: "mul"
     a: nat
@@ -21,7 +21,7 @@ return
     a arg call
     b arg call
 
-type max(a: nat, b: nat)
+def max(a: nat, b: nat)
 return
     call: "max"
     a: nat
@@ -31,7 +31,7 @@ return
     a arg call
     b arg call
 
-type min(a: nat, b: nat)
+def min(a: nat, b: nat)
 return
     call: "min"
     a: nat
@@ -41,7 +41,7 @@ return
     a arg call
     b arg call
 
-type sub(a: nat, b: nat, a followedby b)
+def sub(a: nat, b: nat, a followedby b)
 return
     call: "sub"
     a: nat
@@ -51,7 +51,7 @@ return
     a arg0 call
     b arg1 call
 
-type div(a: nat, b: nat, a followedby b)
+def div(a: nat, b: nat, a followedby b)
 return
     call: "div"
     a: nat
@@ -60,20 +60,3 @@ return
     call returns result
     a arg0 call
     b arg1 call
-
-type optimization_addsub
-    a: nat
-    b: nat
-    adds: "add"
-    subs: "sub"
-    result_add: nat
-    result_sub: nat
-    adds returns result_add
-    subs returns result_sub
-    a arg adds
-    b arg adds
-    result_add arg0 subs
-    b arg1 subs
-// just merge a and the final result
-return(a: nat, result_sub: nat)
-where a = result_sub

@@ -1,7 +1,7 @@
-import ft.impl
+import gs.impl
 
-type nat: Impl::nat
-type pair
+def nat: Impl::nat
+def pair
     x:nat
     y:nat
 return
@@ -9,7 +9,7 @@ return
     y:nat
     x followedby y
 
-type Main
+def Main
     p1: pair
 where
     r3 = Impl::add p1 // the difficulty is that the 'followedby' edge is different

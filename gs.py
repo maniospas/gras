@@ -45,9 +45,9 @@ class Error(Exception):
         return '\n'.join(out)
 
 class Kind(Enum):
-    NAME=auto(); STRING=auto(); REL=auto(); COLON=auto(); PIPE=auto(); UNIVERSE=auto(); TYPE=auto(); RETURN=auto(); LPAR=auto(); RPAR=auto(); WHERE=auto(); REDUCE=auto(); DO=auto(); RUN=auto(); IMPORT=auto(); ALL=auto(); EOL=auto(); COMMA=auto(); EOF=auto()
+    NAME=auto(); STRING=auto(); REL=auto(); COLON=auto(); PIPE=auto(); UNIVERSE=auto(); DEF=auto(); RETURN=auto(); LPAR=auto(); RPAR=auto(); WHERE=auto(); REDUCE=auto(); DO=auto(); RUN=auto(); IMPORT=auto(); ALL=auto(); EOL=auto(); COMMA=auto(); EOF=auto()
 
-KEYWORDS={x:getattr(Kind,x.upper()) for x in ('universe','type','return','where','reduce','do','run','import','all')}
+KEYWORDS={x:getattr(Kind,x.upper()) for x in ('universe','def','return','where','reduce','do','run','import','all')}
 
 @dataclass(frozen=True)
 class Token:
@@ -182,7 +182,7 @@ class Parser:
         if self.peek().kind==Kind.LPAR: self.take(); self.segment_group=mode; self.inner_eols()
     def open_type(self)->None:
         self.finish(); token=self.take()
-        if self.universe is None: raise Error(self.file,token.span,'type outside universe')
+        if self.universe is None: raise Error(self.file,token.span,'def outside universe')
         n=self.expect(Kind.NAME,Kind.STRING)
         self.type,self.mode=Type(self.universe.name,n.text,span=Span(token.span.start,n.span.end)),'input'
         if self.peek().kind==Kind.COLON:
@@ -205,7 +205,7 @@ class Parser:
         fn=self.expect(Kind.NAME) if fn is None else fn; args=[]
         while True:
             if stop_rpar: self.inner_eols()
-            if self.peek().kind in (Kind.EOF,Kind.EOL,Kind.COMMA,Kind.TYPE,Kind.UNIVERSE,Kind.RETURN,Kind.WHERE,Kind.RUN,Kind.IMPORT,Kind.REDUCE): break
+            if self.peek().kind in (Kind.EOF,Kind.EOL,Kind.COMMA,Kind.DEF,Kind.UNIVERSE,Kind.RETURN,Kind.WHERE,Kind.RUN,Kind.IMPORT,Kind.REDUCE): break
             if stop_rpar and self.peek().kind==Kind.RPAR: break
             if self.peek().kind==Kind.NAME and self.peek(1).kind==Kind.REL and self.peek(1).text=='=': break
             if self.peek().kind==Kind.LPAR:
@@ -250,10 +250,10 @@ class Parser:
             k=self.peek().kind
             if k==Kind.RPAR and self.segment_group==self.mode:
                 self.take(); self.segment_group=None; continue
-            if self.segment_group==self.mode and k in (Kind.UNIVERSE,Kind.TYPE,Kind.RETURN,Kind.WHERE,Kind.RUN,Kind.IMPORT):
+            if self.segment_group==self.mode and k in (Kind.UNIVERSE,Kind.DEF,Kind.RETURN,Kind.WHERE,Kind.RUN,Kind.IMPORT):
                 raise Error(self.file,self.peek().span,f"expected ')' to close {self.mode} segment")
             if k==Kind.UNIVERSE: self.open_universe()
-            elif k==Kind.TYPE: self.open_type()
+            elif k==Kind.DEF: self.open_type()
             elif k==Kind.RETURN: self.open_return()
             elif k==Kind.WHERE: self.open_where()
             elif k==Kind.REDUCE:
@@ -283,7 +283,7 @@ def load_program(file:str,source:str|None=None,seen:set[Path]|None=None,cache:di
     if path in seen: return cache.get(path,Program())
     seen.add(path); source=path.read_text(encoding='utf-8') if source is None else source
     def importer(program:Program,name:str,span:Span)->None:
-        raw=name[1:-1] if name.startswith('"') and name.endswith('"') else name.replace('.','/')+'.ft'
+        raw=name[1:-1] if name.startswith('"') and name.endswith('"') else name.replace('.','/')+'.gs'
         child=(path.parent/raw).resolve(); imported=None
         try:
             imported=load_program(str(child),None,seen,cache); Resolver(str(child),imported).resolve(); merge_program(program,imported)
@@ -325,7 +325,7 @@ class Resolver:
 
 @dataclass
 class Node:
-    id:int; types:frozenset[str]; names:dict[str,set[str]]=field(default_factory=dict)
+    id:int; types:frozenset[str]; names:dict[str,set[str]]=field(default_factory=dict); input_names:set[str]=field(default_factory=set)
 
 @dataclass(frozen=True)
 class Edge:
@@ -348,20 +348,21 @@ class Graph:
             if span: raise Error(file,span,f'cannot merge {sorted(x.types)} with {sorted(y.types)}')
             raise ValueError('incompatible node types')
         for theory,names in y.names.items(): x.names.setdefault(theory,set()).update(names)
+        x.input_names.update(y.input_names)
         self.edges=list(dict.fromkeys(Edge(a if e.left==b else e.left,e.tag,a if e.right==b else e.right) for e in self.edges)); del self.nodes[b]; return a
     def induced(self,ids:set[int])->tuple[Graph,dict[int,int]]:
         g,remap=Graph(),{}
         for old in ids:
-            n=self.nodes[old]; new=g.add_node(n.types,'',''); g.nodes[new].names={k:set(v) for k,v in n.names.items()}; remap[old]=new
+            n=self.nodes[old]; new=g.add_node(n.types,'',''); g.nodes[new].names={k:set(v) for k,v in n.names.items()}; g.nodes[new].input_names=set(n.input_names); remap[old]=new
         g.edges=[Edge(remap[e.left],e.tag,remap[e.right]) for e in self.edges if e.left in ids and e.right in ids]; return g,remap
-    def remove_component(self,ids:set[int],protected:set[int],file:str,span:Span)->None:
-        remove=set(ids)
+    def remove_component(self,ids:set[int],protected:set[int],file:str,span:Span,within:set[int]|None=None)->None:
+        remove=set(ids); within=set(self.nodes) if within is None else set(within)
         if remove&protected: raise Error(file,span,f"reduction cleanup would drop output node(s): {', '.join(best_name(self.nodes[i]) for i in sorted(remove&protected) if i in self.nodes)}",self.induced(set(self.nodes))[0])
         while True:
             add=set()
             for e in self.edges:
-                if e.left in remove and e.right not in remove and e.right not in protected: add.add(e.right)
-                if e.right in remove and e.left not in remove and e.left not in protected: add.add(e.left)
+                if e.left in remove and e.right in within and e.right not in remove and e.right not in protected: add.add(e.right)
+                if e.right in remove and e.left in within and e.left not in remove and e.left not in protected: add.add(e.left)
             if not add: break
             remove|=add
         if not set(self.nodes)-remove: raise Error(file,span,'reduction cleanup would remove the entire graph; at least one node must remain after removing the unused reduction component',self.induced(set(self.nodes))[0])
@@ -487,13 +488,19 @@ class Builder:
             tag=e.tag[1:]; a,b=emap[e.left],emap[e.right]
             if any(x.left==a and x.right==b and x.tag==tag for x in actual.edges): lines.append(f'forbidden relation present: {edge_name(actual,a)} {tag} {edge_name(actual,b)}')
         return '; '.join(lines) or 'node identities/relations cannot be mapped consistently'
-    def apply_reduce(self,g:Graph,owner:Type,r:Reduce,selected_override:set[int]|None=None)->None:
+    
+    def apply_reduce(self,g:Graph,owner:Type,r:Reduce,selected_override:set[int]|None=None,match_override:tuple[Type,dict[int,int]]|None=None)->None:
         before=g.induced(set(g.nodes))[0]
         if r.function not in self.groups: raise Error(self.file,r.span,f'unknown function {r.function!r}; no declaration with that qualified name exists',before)
-        selected=self.expand_args(g,r.args,r.span) if selected_override is None else selected_override; actual,actual_map=g.induced(selected); valid=[]; rejected=[]
+        selected=self.expand_args(g,r.args,r.span) if selected_override is None else set(selected_override); actual,actual_map=g.induced(selected); valid=[]; rejected=[]
         for ai,fn in enumerate([x for x in self.groups[r.function] if x.function],1):
+            if match_override is not None and fn is not match_override[0]: continue
             sel=dict(self.types); sel[r.function]=fn; cb=Builder(self.file,self.program,sel); template,inputs,outputs=cb.build_function(fn); expected,expected_map=cb.function_input(fn); allowed=None
             fields=[x for x in fn.inputs if isinstance(x,Field)]
+            if match_override is not None:
+                raw=match_override[1]; match={eid:actual_map[gid] for eid,gid in raw.items() if gid in actual_map}
+                if len(match)==len(expected.nodes): valid.append((fn,template,inputs,outputs,expected,expected_map,match,cb))
+                continue
             if selected_override is None and len(fields)==len(r.args):
                 allowed={}
                 for field,arg in zip(fields,r.args):
@@ -501,30 +508,115 @@ class Builder:
                     for name,eid in expected_map.items():
                         if name==field.name or name.startswith(prefix): allowed[eid]=aids
             match=cb.isomorphism(expected,actual,allowed)
-            if match is not None: valid.append((fn,template,inputs,outputs,expected,expected_map,match))
+            if match is not None: valid.append((fn,template,inputs,outputs,expected,expected_map,match,cb))
             else: rejected.append(f'alternative {ai}: {cb.mismatch(expected,actual)}')
-        if not valid: raise Error(self.file,r.span,f'reduction {r.ret!r} cannot apply {r.function}: no declared function input matches the selected argument graph.\n'+ '\n'.join(rejected),before)
+        if not valid: raise Error(self.file,r.span,f'reduction {r.ret!r} cannot apply {r.function}: no declared function input matches the selected argument graph.\n'+'\n'.join(rejected),before)
         if len(valid)>1: raise Error(self.file,r.span,f'reduction {r.ret!r} is ambiguous: {len(valid)} alternatives of {r.function} match the same argument subgraph; make the function alternatives structurally distinguishable',before)
-        fn,template,inputs,outputs,expected,expected_map,match=valid[0]; input_ids=set(inputs.values())
-        actual_back={v:k for k,v in actual_map.items()}; mapping={inputs[name]:actual_back[match[eid]] for name,eid in expected_map.items()}; output_ids=set(outputs.values()); dead=input_ids-output_ids; created={}
+        fn,template,inputs,outputs,expected,expected_map,match,cb=valid[0]; actual_back={v:k for k,v in actual_map.items()}; output_ids=set(outputs.values())
+        concrete={eid:actual_back[match[eid]] for eid in expected.nodes}; matched_original=set(concrete.values())
+        input_edges={Edge(concrete[e.left],e.tag,concrete[e.right]) for e in expected.edges if not e.tag.startswith('!')}
+        eid_tid={eid:inputs[name] for name,eid in expected_map.items()}; groups={}
+        for name,eid in expected_map.items(): groups.setdefault(inputs[name],[]).append(concrete[eid])
+
+        # A reduce-all match may cover only part of a variadic call's arguments.
+        # Such a call is residual context rather than a node to delete. Lift the
+        # replacement output through that call: keep its surviving operand edge
+        # and returns edge, and use its result as the replacement representative.
+        promoted={}; promoted_operands={}; residual_calls=set(); preserve_edges=set()
+        if selected_override is not None:
+            for ceid,cgid in concrete.items():
+                tid=eid_tid.get(ceid)
+                if tid in output_ids or call_name(g.nodes[cgid]) is None: continue
+                extra=[e for e in g.edges if e.tag=='arg' and e.right==cgid and e not in input_edges and e.left not in matched_original]
+                if not extra: continue
+                rets=[e for e in expected.edges if not e.tag.startswith('!') and e.left==ceid and e.tag=='returns']
+                if len(rets)!=1: raise Error(self.file,r.span,f'reduction {r.ret!r} cannot preserve variadic context around {best_name(g.nodes[cgid])!r}: the matched call needs exactly one returns edge',before)
+                rgid=concrete[rets[0].right]
+                args=[e for e in expected.edges if not e.tag.startswith('!') and e.right==ceid and e.tag=='arg']
+                tids={eid_tid[e.left] for e in args if eid_tid.get(e.left) in output_ids}
+                if len(tids)!=1: raise Error(self.file,r.span,f'reduction {r.ret!r} cannot lift variadic context around {best_name(g.nodes[cgid])!r}: exactly one returned input identity must remain in the output',before)
+                ptid=next(iter(tids))
+                if ptid in promoted and promoted[ptid][0]!=rgid: raise Error(self.file,r.span,f'reduction {r.ret!r} has conflicting residual variadic outputs',before)
+                ops={concrete[e.left] for e in args if eid_tid.get(e.left)==ptid}
+                promoted[ptid]=(rgid,cgid); promoted_operands.setdefault(ptid,set()).update(ops); residual_calls.add(cgid)
+                preserve_edges.add(Edge(cgid,'returns',rgid)); preserve_edges|={Edge(x,'arg',cgid) for x in ops}
+
+        if selected_override is not None:
+            consumed=input_edges-preserve_edges; g.edges=[e for e in g.edges if e not in consumed]
+
+        redirect={i:i for i in matched_original}
+        def resolve(i:int)->int:
+            while redirect.get(i,i)!=i: i=redirect[i]
+            return i
+        def merge_into(a:int,b:int)->int:
+            a,b=resolve(a),resolve(b)
+            if a==b: return a
+            g.merge(a,b,r.span,self.file)
+            for k,v in list(redirect.items()):
+                if resolve(v)==b or v==b: redirect[k]=a
+            redirect[b]=a; selected.discard(b); selected.add(a)
+            return a
+
+        mapping={}; operand_keep={x for xs in promoted_operands.values() for x in xs}
+        for tid,gids in groups.items():
+            gids=list(dict.fromkeys(gids))
+            if tid in promoted:
+                gid=resolve(promoted[tid][0])
+                for other in gids:
+                    other=resolve(other)
+                    if other==gid or other in {resolve(x) for x in promoted_operands.get(tid,set())}: continue
+                    gid=merge_into(gid,other)
+                mapping[tid]=gid
+            else:
+                live=[resolve(x) for x in gids if resolve(x) in g.nodes]
+                if not live: continue
+                gid=live[0]
+                for other in live[1:]: gid=merge_into(gid,other)
+                mapping[tid]=gid
+        for tid,(rgid,cgid) in list(promoted.items()): promoted[tid]=(resolve(rgid),resolve(cgid)); mapping[tid]=resolve(rgid)
+
         for tid,gid in mapping.items():
+            if gid not in g.nodes: continue
             for theory,names in template.nodes[tid].names.items(): g.nodes[gid].names.setdefault(theory,set()).update(names)
-        preserved=[e for e in g.edges if not e.tag.startswith('!') and e.left in selected and e.right in selected]
+
+        created={}
         for name,tid in outputs.items():
             full=f'{r.ret}.{name}'
-            if tid in mapping: gid=mapping[tid]; g.nodes[gid].names.setdefault(owner.universe,set()).add(full); created[tid]=gid
-            elif tid in created: g.nodes[created[tid]].names.setdefault(owner.universe,set()).add(full)
+            if tid in mapping: gid=mapping[tid]
+            elif tid in created: gid=created[tid]
             else: gid=g.add_node(template.nodes[tid].types,owner.universe,full); created[tid]=gid
+            g.nodes[gid].names.setdefault(owner.universe,set()).add(full); created[tid]=gid
         allmap=mapping|created
-        for e in template.edges:
-            if not e.tag.startswith('!') and e.left in allmap and e.right in allmap:
-                edge=Edge(allmap[e.left],e.tag,allmap[e.right])
+
+        # Ordinary calls assert/materialize their positive input relations; an
+        # automatic rewrite consumes its matched input instead.
+        if selected_override is None:
+            rev={i:name for name,i in expected_map.items()}
+            for e in expected.edges:
+                if e.tag.startswith('!'): continue
+                edge=Edge(allmap[inputs[rev[e.left]]],e.tag,allmap[inputs[rev[e.right]]])
                 if edge not in g.edges: g.edges.append(edge)
-        g.remove_component({mapping[x] for x in dead},set(created.values())|{mapping[x] for x in output_ids if x in mapping},self.file,r.span)
-        for e in preserved:
-            if e.left in g.nodes and e.right in g.nodes and e not in g.edges: g.edges.append(e)
+
+        outg=Graph(); outnames=cb.add_shape(outg,fn,'',fn.universe,True); outrev={i:outputs[name] for name,i in outnames.items()}
+        for e in outg.edges:
+            edge=Edge(allmap[outrev[e.left]],e.tag,allmap[outrev[e.right]])
+            if edge not in g.edges: g.edges.append(edge)
+
+        if selected_override is not None:
+            matched={resolve(i) for i in matched_original if resolve(i) in g.nodes}
+            protected={allmap[tid] for tid in output_ids if tid in allmap}|{resolve(i) for i in residual_calls if resolve(i) in g.nodes}|{resolve(i) for i in operand_keep if resolve(i) in g.nodes}
+            # A matched node with surviving context outside the match is itself
+            # context and must remain. Internal unmatched edges do not anchor it.
+            for e in g.edges:
+                if e.tag.startswith('!'): continue
+                if e.left in matched and e.right not in matched: protected.add(e.left)
+                if e.right in matched and e.left not in matched: protected.add(e.right)
+            remove=matched-protected
+            if remove: g.remove_component(remove,protected,self.file,r.span,matched)
+
         lost=[name for name,tid in outputs.items() if allmap.get(tid) not in g.nodes]
         if lost: raise Error(self.file,r.span,f"reduction {r.ret!r} would drop output node(s): {', '.join(lost)}",before)
+
     def graph_shape(self,g:Graph)->tuple:
         ns=tuple(sorted(tuple(sorted(n.types)) for n in g.nodes.values()))
         es=tuple(sorted((tuple(sorted(g.nodes[e.left].types)),e.tag,tuple(sorted(g.nodes[e.right].types))) for e in g.edges))
@@ -539,10 +631,10 @@ class Builder:
                 sel=dict(self.types); sel[r.function]=fn; cb=Builder(self.file,self.program,sel); expected,_=cb.function_input(fn); match=cb.subgraph_isomorphism(expected,g)
                 if match is not None:
                     rarity=min((sum(g.nodes[y].types==expected.nodes[x].types for y in g.nodes),x) for x in expected.nodes)[0]
-                    choices.append((rarity,set(match.values())))
+                    choices.append((rarity,fn,match))
             if not choices: return
-            choices.sort(key=lambda x:x[0]); tmp=Reduce(f'{r.ret}{len(before_seen)-1}',r.function,[],r.span)
-            self.apply_reduce(g,owner,tmp,choices[0][1])
+            choices.sort(key=lambda x:x[0]); _,fn,match=choices[0]; tmp=Reduce(f'{r.ret}{len(before_seen)-1}',r.function,[],r.span)
+            self.apply_reduce(g,owner,tmp,set(match.values()),(fn,match))
 
 def selections(program:Program)->list[dict[str,Type]]:
     groups={}
@@ -620,6 +712,7 @@ def build_variants(file:str,program:Program,t:Type)->list[Graph]:
         return variants
     def apply_where(g:Graph)->Graph:
         b=Builder(file,program)
+        for n in g.nodes.values(): n.input_names.update(name for names in n.names.values() for name in names if name)
         for w in t.where or []:
             if isinstance(w,Relation):
                 if w.tag!='=': raise Error(file,w.span,f"where relation {w.left} {w.tag} {w.right} is invalid: where relations merge identities and therefore must use '='")
@@ -642,29 +735,38 @@ def merge_graphs(a:Graph,b:Graph)->Graph:
     for src in (a,b):
         m={}
         for old,n in src.nodes.items():
-            i=g.add_node(n.types,'',''); g.nodes[i].names={k:set(v) for k,v in n.names.items()}; m[old]=i
+            i=g.add_node(n.types,'',''); g.nodes[i].names={k:set(v) for k,v in n.names.items()}; g.nodes[i].input_names=set(n.input_names); m[old]=i
         g.edges += [Edge(m[e.left],e.tag,m[e.right]) for e in src.edges]; maps.append(m)
     return g
 
+def aliases(n:Node)->list[str]: return sorted({name for names in n.names.values() for name in names if name},key=lambda x:(len(x),x))
 def best_name(n:Node)->str:
-    names=[(theory,name) for theory,values in n.names.items() for name in values]
-    return min(names,key=lambda x:(x[1].count('.'),len(x[1]),x[1]))[1] if names else f'#{n.id}'
-def aliasfmt(n:Node)->str:
-    groups=[]
-    for theory,names in sorted(n.names.items()):
-        if names: groups.append(f"{gray(theory+'::')}[{(' '+gray('=')+' ').join(cyan(x) for x in sorted(names))}]")
-    return '  '.join(groups) if groups else gray(f'#{n.id}')
-def print_node(n:Node,indent:int=0)->None: print(' '*indent+f"{aliasfmt(n)} {gray(':')} {gray(' | ').join(typefmt(x) for x in sorted(n.types))}")
-def print_edge(g:Graph,e:Edge,indent:int=0)->None: print(' '*indent+f'{cyan(best_name(g.nodes[e.left]))} {C.BOLD}{e.tag}{C.RESET} {cyan(best_name(g.nodes[e.right]))}')
+    names=sorted(n.input_names,key=lambda x:(len(x),x)) or aliases(n)
+    return names[0] if names else f'#{n.id}'
+def graph_names(g:Graph,ids:set[int]|None=None)->dict[int,str]:
+    ids=set(g.nodes) if ids is None else set(ids); candidates={}
+    for i in ids:
+        n=g.nodes[i]; xs=sorted(n.input_names,key=lambda x:(len(x),x)) or aliases(n); candidates[i]=xs
+    counts={x:sum(x in xs for xs in candidates.values()) for xs0 in candidates.values() for x in xs0}
+    return {i:(next((x for x in xs if counts[x]==1),xs[0] if xs else f'#{i}')) for i,xs in candidates.items()}
+def aliasfmt(n:Node,first:str|None=None)->str:
+    xs=aliases(n)
+    if first in xs: xs=[first]+[x for x in xs if x!=first]
+    return (' '+gray('=')+' ').join(cyan(x) for x in xs) if xs else gray(f'#{n.id}')
+def print_node(n:Node,indent:int=0,name:str|None=None)->None: print(' '*indent+f"{cyan(name or best_name(n))} {gray(':')} {gray(' | ').join(typefmt(x) for x in sorted(n.types))}")
+def print_edge(g:Graph,e:Edge,indent:int=0,names:dict[int,str]|None=None)->None:
+    names=names or graph_names(g); print(' '*indent+f'{cyan(names[e.left])} {C.BOLD}{e.tag}{C.RESET} {cyan(names[e.right])}')
 def print_graph(g:Graph,indent:int=0)->None:
     if not g.nodes: print(' '*indent+gray('∅')); return
-    for n in sorted(g.nodes.values(),key=best_name): print_node(n,indent)
-    for e in g.edges: print_edge(g,e,indent)
+    names=graph_names(g)
+    for i in sorted(g.nodes,key=lambda i:names[i]): print_node(g.nodes[i],indent,names[i])
+    for e in g.edges: print_edge(g,e,indent,names)
 def print_subgraph(g:Graph,ids:set[int],indent:int=0)->None:
     if not ids: print(' '*indent+gray('∅')); return
-    for i in sorted(ids,key=lambda x:best_name(g.nodes[x])): print_node(g.nodes[i],indent)
+    names=graph_names(g,ids)
+    for i in sorted(ids,key=lambda i:names[i]): print_node(g.nodes[i],indent,names[i])
     for e in g.edges:
-        if e.left in ids and e.right in ids: print_edge(g,e,indent)
+        if e.left in ids and e.right in ids: print_edge(g,e,indent,names)
 
 TYPE_CONVERTERS={"Impl::Nat":int,"Impl::Int":int,"Impl::Real":float,"Impl::Float":float,"Impl::String":str,"Impl::nat":int,"Impl::int":int,"Impl::real":float,"Impl::float":float,"Impl::string":str}
 IMPL_FUNCTIONS={}
@@ -755,9 +857,9 @@ def root_converter(n:Node):
     if len(cs)!=1: raise ValueError(f"root {best_name(n)!r} needs exactly one converter; available types are {', '.join(sorted(n.types)) or 'none'}")
     return cs[0]
 def execute_graph(g:Graph,raw:dict[str,str])->tuple[dict[int,object],list[int]]:
-    values={}
-    for i in runtime_roots(g):
-        n=g.nodes[i]; key=best_name(n); typ,conv=root_converter(n)
+    values={}; roots=runtime_roots(g); names=graph_names(g,set(roots))
+    for i in roots:
+        n=g.nodes[i]; key=names[i]; typ,conv=root_converter(n)
         if key not in raw: raise ValueError(f'missing input for {key} ({typ})')
         try: values[i]=conv(raw[key])
         except Exception as e: raise ValueError(f'cannot convert input {key}={raw[key]!r} as {typ}: {e}') from e
@@ -783,10 +885,10 @@ def execute_graph(g:Graph,raw:dict[str,str])->tuple[dict[int,object],list[int]]:
     return values,runtime_sinks(g)
 def console_runs(file:str,program:Program)->None:
     for r in program.runs:
-        g=runtime_graph(file,program,r); raw={}
+        g=runtime_graph(file,program,r); raw={}; roots=runtime_roots(g); names=graph_names(g,set(roots))
         print(f'\n{kw("run")} {typefmt(r.name)}')
-        for i in runtime_roots(g):
-            n=g.nodes[i]; typ,_=root_converter(n); raw[best_name(n)]=input(f'{best_name(n)} ({typ}): ')
+        for i in roots:
+            n=g.nodes[i]; typ,_=root_converter(n); raw[names[i]]=input(f'{names[i]} ({typ}): ')
         values,sinks=execute_graph(g,raw)
         for i in sinks: print(f'{cyan(best_name(g.nodes[i]))} {gray("=")} {values[i]}')
 
@@ -795,7 +897,7 @@ def print_program(program:Program,builder:Builder)->None:
         if ui: print()
         print(f'{C.BOLD}{kw("universe")} {green(u.name)}{C.RESET}')
         for t in [x for x in u.types if not is_literal(x.name)]:
-            print(); print(f'{kw("type")} {green(t.name)}')
+            print(); print(f'{kw("def")} {green(t.name)}')
             if t.function:
                 g,ins,outs=builder.build_function(t); ig,iins=builder.function_input(t); print(kw('input')); print_subgraph(ig,set(iins.values()),4); print(kw('return')); print_subgraph(g,set(outs.values()),4)
             else:
@@ -809,21 +911,17 @@ def html_type(s:str)->str:
     if '::' not in s: return f'<span class="literal">{h(s)}</span>' if is_literal(s) else f'<span class="type">{h(s)}</span>'
     u,n=s.rsplit('::',1); cls='literal' if is_literal(n) else 'type'; return f'<span class="qualifier">{h(u)}::</span><span class="{cls}">{h(n)}</span>'
 def html_name(s:str)->str: return f'<span class="name">{h(s)}</span>'
-def html_alias(n:Node)->str:
-    groups=[]
-    for theory,names in sorted(n.names.items()):
-        if names: groups.append(f'<span class="qualifier">{h(theory)}::</span><span class="bracket">[</span>'+ '<span class="equal"> = </span>'.join(html_name(x) for x in sorted(names)) + '<span class="bracket">]</span>')
-    return ' '.join(groups) if groups else f'<span class="qualifier">#{n.id}</span>'
-def html_node(n:Node)->str: return f'<div class="statement">{html_alias(n)} <span class="muted">:</span> '+ '<span class="muted"> | </span>'.join(html_type(x) for x in sorted(n.types)) + '</div>'
-def html_edge(g:Graph,e:Edge)->str: return f'<div class="statement">{html_name(best_name(g.nodes[e.left]))} <span class="relation">{h(e.tag)}</span> {html_name(best_name(g.nodes[e.right]))}</div>'
+def html_node(n:Node,name:str)->str: return f'<div class="statement">{html_name(name)} <span class="muted">:</span> '+ '<span class="muted"> | </span>'.join(html_type(x) for x in sorted(n.types)) + '</div>'
+def html_edge(g:Graph,e:Edge,names:dict[int,str])->str: return f'<div class="statement">{html_name(names[e.left])} <span class="relation">{h(e.tag)}</span> {html_name(names[e.right])}</div>'
 def html_graph(g:Graph,ids:set[int]|None=None)->str:
-    ids=set(g.nodes) if ids is None else ids
+    ids=set(g.nodes) if ids is None else set(ids)
     if not ids: return '<div class="empty">∅</div>'
-    return '\n'.join([html_node(g.nodes[i]) for i in sorted(ids,key=lambda x:best_name(g.nodes[x]))]+[html_edge(g,e) for e in g.edges if e.left in ids and e.right in ids])
+    names=graph_names(g,ids)
+    return '\n'.join([html_node(g.nodes[i],names[i]) for i in sorted(ids,key=lambda i:names[i])]+[html_edge(g,e,names) for e in g.edges if e.left in ids and e.right in ids])
 
 def graph_data(g:Graph,ids:set[int]|None=None)->str:
-    ids=set(g.nodes) if ids is None else ids
-    data={"nodes":[{"key":str(i),"id":i,"label":best_name(g.nodes[i]),"types":sorted(g.nodes[i].types),"names":{u:sorted(ns) for u,ns in sorted(g.nodes[i].names.items())}} for i in ids],"edges":[{"key":str(k),"source":str(e.left),"target":str(e.right),"label":e.tag} for k,e in enumerate(g.edges) if e.left in ids and e.right in ids]}
+    ids=set(g.nodes) if ids is None else set(ids); names=graph_names(g,ids)
+    data={"nodes":[{"key":str(i),"id":i,"label":names[i]+' : '+' | '.join(sorted(g.nodes[i].types)),"types":sorted(g.nodes[i].types),"aliases":([names[i]]+[x for x in aliases(g.nodes[i]) if x!=names[i]])} for i in ids],"edges":[{"key":str(k),"source":str(e.left),"target":str(e.right),"label":e.tag} for k,e in enumerate(g.edges) if e.left in ids and e.right in ids]}
     return h(json.dumps(data))
 def graph_button(g:Graph,ids:set[int]|None=None,label:str='👁')->str: return f'<button class="graph-btn" title="View graph" aria-label="View graph" data-graph="{graph_data(g,ids)}">{h(label)}</button>'
 def error_card(e:Error)->str:
@@ -846,9 +944,9 @@ def run_html(program:Program,file:str)->str:
     out=[]
     for ri,r in enumerate(program.runs):
         try:
-            g=runtime_graph(file,program,r); roots=runtime_roots(g); fields=[]
+            g=runtime_graph(file,program,r); roots=runtime_roots(g); fields=[]; names=graph_names(g,set(roots))
             for i in roots:
-                n=g.nodes[i]; typ,_=root_converter(n); fields.append(f'<label class="run-field"><span>{h(best_name(n))} <small>{h(typ)}</small></span><input data-name="{h(best_name(n))}"></label>')
+                n=g.nodes[i]; typ,_=root_converter(n); fields.append(f'<label class="run-field"><span>{h(names[i])} <small>{h(typ)}</small></span><input data-name="{h(names[i])}"></label>')
             out.append(f'<article class="run-card" data-run="{ri}"><h3><span class="keyword">run</span> {html_type(r.name)}{graph_button(g)}</h3><div class="run-inputs">{"".join(fields)}</div><button class="run-exec">Run</button><div class="run-results"></div></article>')
         except (Error,ValueError) as e:
             out.append(error_card(e) if isinstance(e,Error) else f'<div class="error-card"><strong>run error</strong><span>{h(str(e))}</span></div>')
@@ -859,7 +957,7 @@ def inferred_html(program:Program,file:str,limit:Error|None)->str:
     for u in program.universes:
         ub=[]; failed=False
         for t in [x for x in u.types if not is_literal(x.name)]:
-            ub.append(f'<article><h3><span class="keyword">type</span> <span class="type">{h(t.name)}</span></h3>')
+            ub.append(f'<article><h3><span class="keyword">def</span> <span class="type">{h(t.name)}</span></h3>')
             try:
                 if t.function:
                     g,ins,outs=builder.build_function(t); ig,iins=builder.function_input(t); ub.append('<div class="section-keyword">inputs '+graph_button(ig,set(iins.values()))+'</div><div class="function-body">'+html_graph(ig,set(iins.values()))+'</div><div class="section-keyword">return type '+graph_button(g,set(outs.values()))+'</div><div class="function-body">'+html_graph(g,set(outs.values()))+'</div>')
@@ -884,7 +982,7 @@ def export_html(program:Program,file:str,source:str,error:Error|None)->Path:
 def playground_document(initial:str,title:str)->str:
     base=html_document(Program(),title,initial,None)
     css="""<style>#play{position:fixed;inset:58px 50% 0 0;z-index:5;background:#12151c;border-right:1px solid #2a3040}.editwrap{position:absolute;inset:38px 0 0}.editwrap textarea,.editwrap pre{position:absolute;inset:0;margin:0;padding:20px 22px;border:0;overflow:auto;font:14px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4;white-space:pre}.editwrap textarea{z-index:2;resize:none;background:transparent;color:transparent;caret-color:white;-webkit-text-fill-color:transparent;outline:none}.editwrap pre{z-index:1;pointer-events:none;color:#d9deea}.hl-k{color:#c792ea;font-weight:600}.hl-t{color:#8bd49c}.hl-s{color:#ffd580}.hl-c{color:#596174}.hl-o{color:#f07178}#rerun{margin-left:14px;color:#d9deea;background:#222735;border:1px solid #384055;border-radius:7px;padding:6px 15px;font:inherit;cursor:pointer}main{grid-template-columns:1fr}main .source{display:none}main .inference{margin-left:50%;width:50%}@media(max-width:850px){#play{position:relative;inset:auto;height:50vh}main .inference{margin-left:0;width:100%}}</style>"""
-    script=r"""<script>const ed=document.getElementById('editor'),hc=document.getElementById('highlightCode'),hp=document.getElementById('highlight'),btn=document.getElementById('rerun'),inf=document.querySelector('.inference');function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}function scan(s){let types=new Set(),rels=new Set(),ts=[],i=0;while(i<s.length){if(s[i]=='\n'||s[i]==','){ts.push(['sep',s[i]]);i++;continue}if(/\s/.test(s[i])){i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);i=j<0?s.length:j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}ts.push(['str',s.slice(i,j)]);i=j;continue}let m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.]*(?:::[A-Za-z_][A-Za-z0-9_.]*)*/);if(m){let v=m[0],k=/^(universe|namespace|type|return|where|reduce|all|do|run|import)$/.test(v)?'kw':'name';ts.push([k,v]);i+=v.length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m){ts.push(['rel',m[0]]);i+=m[0].length;continue}if(s[i]==':'||s[i]=='|'||s[i]=='('||s[i]==')'){ts.push([s[i],s[i]]);i++;continue}i++}for(let j=0;j+1<ts.length;j++)if(ts[j][0]=='kw'&&/^(type|namespace|universe)$/.test(ts[j][1])&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))types.add(ts[j+1][1]);let j=0,mode='top';while(j<ts.length){let t=ts[j];if(t[0]=='kw'){if(t[1]=='universe'||t[1]=='namespace'||t[1]=='type'){j+=2;mode=t[1]=='type'?'body':'top';continue}if(t[1]=='return'||t[1]=='where'){mode=t[1];j++;continue}if(t[1]=='run'||t[1]=='import'){mode='top';j+=2;continue}j++;continue}if(mode=='top'||t[0]!='name'){j++;continue}if(j+1<ts.length&&ts[j+1][0]==':'){j+=2;if(j<ts.length&&(ts[j][0]=='name'||ts[j][0]=='str'))j++;while(j+1<ts.length&&ts[j][0]=='|'&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))j+=2;continue}if(j+2<ts.length&&(ts[j+1][0]=='rel'||ts[j+1][0]=='name')&&(ts[j+2][0]=='name'||ts[j+2][0]=='str'||ts[j+2][0]=='kw')){let mid=ts[j+1],right=ts[j+2];if(!(mid[1]=='='&&right[0]=='kw'&&right[1]=='reduce'))rels.add(mid[1]);j+=3;continue}j++}return{types,rels}}function hi(){let s=ed.value,o='',i=0,{types,rels}=scan(s);while(i<s.length){if(s[i]=='('||s[i]==')'){o+='<span class="hl-s">'+s[i]+'</span>';i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);if(j<0)j=s.length;o+='<span class="hl-c">'+esc(s.slice(i,j))+'</span>';i=j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}o+='<span class="hl-s">'+esc(s.slice(i,j))+'</span>';i=j;continue}let m=s.slice(i).match(/^(universe|namespace|type|return|where|reduce|all|do|run|import)\b/);if(m){o+='<span class="hl-k">'+m[0]+'</span>';i+=m[0].length;continue}m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);if(m&&(types.has(m[0])||rels.has(m[0]))){o+='<span class="'+(types.has(m[0])?'hl-t':'hl-o')+'">'+esc(m[0])+'</span>';i+=m[0].length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m&&rels.has(m[0])){o+='<span class="hl-o">'+esc(m[0])+'</span>';i+=m[0].length;continue}o+=esc(s[i++])}hc.innerHTML=o+'\n'}async function go(){btn.disabled=true;btn.textContent='Running…';try{let r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:ed.value})}),d=await r.json();inf.innerHTML='<div class="pane-title">inference</div>'+d.html;requestAnimationFrame(()=>{let e=inf.querySelector('.error-card');if(e)e.scrollIntoView({block:'end',behavior:'smooth'});else inf.scrollTop=inf.scrollHeight})}catch(e){inf.innerHTML='<div class="error-card"><strong>server error</strong><span>'+esc(String(e))+'</span></div>';requestAnimationFrame(()=>inf.querySelector('.error-card')?.scrollIntoView({block:'end',behavior:'smooth'}))}finally{btn.disabled=false;btn.textContent='Run'}}let timer;ed.addEventListener('input',()=>{hi();clearTimeout(timer);timer=setTimeout(go,300)});ed.addEventListener('scroll',()=>{hp.scrollTop=ed.scrollTop;hp.scrollLeft=ed.scrollLeft});ed.addEventListener('keydown',e=>{if(e.key==='Tab'){e.preventDefault();let a=ed.selectionStart,b=ed.selectionEnd;ed.setRangeText('    ',a,b,'end');hi()}if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();go()}});document.addEventListener('click',async e=>{let b=e.target.closest('.run-exec');if(!b)return;let card=b.closest('.run-card'),values={};card.querySelectorAll('input[data-name]').forEach(x=>values[x.dataset.name]=x.value);b.disabled=true;try{let r=await fetch('/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:ed.value,run:Number(card.dataset.run),values})}),d=await r.json(),out=card.querySelector('.run-results');if(d.error)out.innerHTML='<div class="error-card"><strong>run error</strong><span>'+esc(d.error)+'</span></div>';else out.innerHTML=d.results.map(x=>'<div class="statement"><span class="name">'+esc(x.name)+'</span> <span class="equal">=</span> '+esc(x.value)+'</div>').join('');requestAnimationFrame(()=>requestAnimationFrame(()=>out.scrollIntoView({block:'end',behavior:'smooth'})))}finally{b.disabled=false}});btn.onclick=go;hi();if(ed.value.trim())go();</script>"""
+    script=r"""<script>const ed=document.getElementById('editor'),hc=document.getElementById('highlightCode'),hp=document.getElementById('highlight'),btn=document.getElementById('rerun'),inf=document.querySelector('.inference');function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}function scan(s){let types=new Set(),rels=new Set(),ts=[],i=0;while(i<s.length){if(s[i]=='\n'||s[i]==','){ts.push(['sep',s[i]]);i++;continue}if(/\s/.test(s[i])){i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);i=j<0?s.length:j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}ts.push(['str',s.slice(i,j)]);i=j;continue}let m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.]*(?:::[A-Za-z_][A-Za-z0-9_.]*)*/);if(m){let v=m[0],k=/^(universe|namespace|def|return|where|reduce|all|do|run|import)$/.test(v)?'kw':'name';ts.push([k,v]);i+=v.length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m){ts.push(['rel',m[0]]);i+=m[0].length;continue}if(s[i]==':'||s[i]=='|'||s[i]=='('||s[i]==')'){ts.push([s[i],s[i]]);i++;continue}i++}for(let j=0;j+1<ts.length;j++)if(ts[j][0]=='kw'&&/^(type|namespace|universe)$/.test(ts[j][1])&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))types.add(ts[j+1][1]);let j=0,mode='top';while(j<ts.length){let t=ts[j];if(t[0]=='kw'){if(t[1]=='universe'||t[1]=='namespace'||t[1]=='type'){j+=2;mode=t[1]=='type'?'body':'top';continue}if(t[1]=='return'||t[1]=='where'){mode=t[1];j++;continue}if(t[1]=='run'||t[1]=='import'){mode='top';j+=2;continue}j++;continue}if(mode=='top'||t[0]!='name'){j++;continue}if(j+1<ts.length&&ts[j+1][0]==':'){j+=2;if(j<ts.length&&(ts[j][0]=='name'||ts[j][0]=='str'))j++;while(j+1<ts.length&&ts[j][0]=='|'&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))j+=2;continue}if(j+2<ts.length&&(ts[j+1][0]=='rel'||ts[j+1][0]=='name')&&(ts[j+2][0]=='name'||ts[j+2][0]=='str'||ts[j+2][0]=='kw')){let mid=ts[j+1],right=ts[j+2];if(!(mid[1]=='='&&right[0]=='kw'&&right[1]=='reduce'))rels.add(mid[1]);j+=3;continue}j++}return{types,rels}}function hi(){let s=ed.value,o='',i=0,{types,rels}=scan(s);while(i<s.length){if(s[i]=='('||s[i]==')'){o+='<span class="hl-s">'+s[i]+'</span>';i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);if(j<0)j=s.length;o+='<span class="hl-c">'+esc(s.slice(i,j))+'</span>';i=j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}o+='<span class="hl-s">'+esc(s.slice(i,j))+'</span>';i=j;continue}let m=s.slice(i).match(/^(universe|namespace|def|return|where|reduce|all|do|run|import)\b/);if(m){o+='<span class="hl-k">'+m[0]+'</span>';i+=m[0].length;continue}m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);if(m&&(types.has(m[0])||rels.has(m[0]))){o+='<span class="'+(types.has(m[0])?'hl-t':'hl-o')+'">'+esc(m[0])+'</span>';i+=m[0].length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m&&rels.has(m[0])){o+='<span class="hl-o">'+esc(m[0])+'</span>';i+=m[0].length;continue}o+=esc(s[i++])}hc.innerHTML=o+'\n'}async function go(){btn.disabled=true;btn.textContent='Running…';try{let r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:ed.value})}),d=await r.json();inf.innerHTML='<div class="pane-title">inference</div>'+d.html;requestAnimationFrame(()=>{let e=inf.querySelector('.error-card');if(e)e.scrollIntoView({block:'end',behavior:'smooth'});else inf.scrollTop=inf.scrollHeight})}catch(e){inf.innerHTML='<div class="error-card"><strong>server error</strong><span>'+esc(String(e))+'</span></div>';requestAnimationFrame(()=>inf.querySelector('.error-card')?.scrollIntoView({block:'end',behavior:'smooth'}))}finally{btn.disabled=false;btn.textContent='Run'}}let timer;ed.addEventListener('input',()=>{hi();clearTimeout(timer);timer=setTimeout(go,300)});ed.addEventListener('scroll',()=>{hp.scrollTop=ed.scrollTop;hp.scrollLeft=ed.scrollLeft});ed.addEventListener('keydown',e=>{if(e.key==='Tab'){e.preventDefault();let a=ed.selectionStart,b=ed.selectionEnd;ed.setRangeText('    ',a,b,'end');hi()}if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();go()}});document.addEventListener('click',async e=>{let b=e.target.closest('.run-exec');if(!b)return;let card=b.closest('.run-card'),values={};card.querySelectorAll('input[data-name]').forEach(x=>values[x.dataset.name]=x.value);b.disabled=true;try{let r=await fetch('/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:ed.value,run:Number(card.dataset.run),values})}),d=await r.json(),out=card.querySelector('.run-results');if(d.error)out.innerHTML='<div class="error-card"><strong>run error</strong><span>'+esc(d.error)+'</span></div>';else out.innerHTML=d.results.map(x=>'<div class="statement"><span class="name">'+esc(x.name)+'</span> <span class="equal">=</span> '+esc(x.value)+'</div>').join('');requestAnimationFrame(()=>requestAnimationFrame(()=>out.scrollIntoView({block:'end',behavior:'smooth'})))}finally{b.disabled=false}});btn.onclick=go;hi();if(ed.value.trim())go();</script>"""
     editor=f'<div id="play"><div class="pane-title">source</div><div class="editwrap"><pre id="highlight"><code id="highlightCode"></code></pre><textarea id="editor" spellcheck="false">{h(initial)}</textarea></div></div>'
     base=base.replace('</head>',css+'</head>').replace('</header>', '<button id="rerun">Run</button></header>').replace('<main>',editor+'<main>').replace('</body>',script+'</body>')
     return base
@@ -900,7 +998,7 @@ def infer_editor(source:str,file:str='<editor>')->tuple[str,Error|None]:
         except Error: pass
         rendered=inferred_html(program,file,e); return rendered if 'error-card' in rendered else rendered+error_card(e),e
 
-def serve(initial:str='',title:str='FT playground',file:str='<editor>')->None:
+def serve(initial:str='',title:str='GSlang',file:str='<editor>')->None:
     page=playground_document(initial,title).encode('utf-8')
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,fmt,*args)->None: return
