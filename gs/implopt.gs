@@ -1,6 +1,5 @@
 import impl
-universe Implopt
-def nat: Impl::nat
+universe Implopt uses Impl
 
 def merge_add
     a: nat

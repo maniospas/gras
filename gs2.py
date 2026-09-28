@@ -177,8 +177,6 @@ class Parser:
     def finish(self)->None:
         if self.type is None: return
         if self.type.outputs is not None:
-            if self.type.return_all and self.type.where is None:
-                raise Error(self.file,self.type.span or self.peek().span,"return marker 'all' requires a where block so the return graph can be discovered after evaluating where")
             names={x.name for x in self.type.inputs if isinstance(x,Field)}
             #for x in self.type.outputs:
             #    if isinstance(x,Field) and x.name in names: raise Error(self.file,x.span,f'{x.name!r} is both input and output')
@@ -209,6 +207,8 @@ class Parser:
         if self.type.outputs is not None: raise Error(self.file,token.span,f"duplicate return clause in {self.type.full!r}; a declaration may have only one 'return' or 'return all' clause")
         if self.type.where is not None: raise Error(self.file,token.span,f"return clause appears after 'where' in {self.type.full!r}; put 'return'/'return all' before the where block so the return policy is known while the graph is built")
         self.type.outputs,self.mode=[],'output'
+        if self.peek().kind==Kind.ALL:
+            self.take(); self.type.return_all=True
         self.group_segment('output')
     def open_where(self)->None:
         token=self.take()
@@ -287,8 +287,10 @@ class Parser:
         fn=self.expect(Kind.NAME); self.call(self.temporary(),token.span.start,fn)
     def statement(self)->None:
         if self.type is None: raise Error(self.file,self.peek().span,'statement is outside any declaration; start a declaration with def before adding variables or relations')
-        if self.mode=='output' and self.peek().kind==Kind.ALL:
-            self.take(); self.type.return_all=True; return
+        if self.mode=='output' and self.type.return_all:
+            raise Error(self.file,self.peek().span,
+                f"{self.type.full!r} uses 'return all', so explicit return variables/relations are not allowed. "
+                "Put derived variables in the subsequent where block; they will be collected automatically after that block is built")
         if self.mode=='where' and self.peek().kind==Kind.REDUCE: self.reduce_statement(); return
         if self.peek().kind==Kind.LPAR:
             self.take(); self.inner_eols(); ret=self.statement(); self.inner_eols(); self.expect(Kind.RPAR); return ret
@@ -550,41 +552,14 @@ class Builder:
                     refreshed[name]=gid
             ins=refreshed
 
-            # `all` is a marker inside the return item stream, not an exclusive
-            # return form.  The where block has now run, so explicit return items are
-            # interpreted against the discovered graph.  Fields bind/check names;
-            # relations may refer to structured discovered names and expand over them.
-            explicit_fields=[x for x in (t.outputs or []) if isinstance(x,Field)]
-            if explicit_fields:
-                shape=Type(t.universe,t.name,outputs=explicit_fields,span=t.span,uses=list(t.uses))
-                declared=self.add_shape(g,shape,'',t.universe,True)
-                for name,newid in list(declared.items()):
-                    others=[i for i,n in g.nodes.items() if i!=newid and name in n.names.get(t.universe,set())]
-                    for oldid in others:
-                        if newid not in g.nodes or oldid not in g.nodes: continue
-                        if g.nodes[newid].types!=g.nodes[oldid].types:
-                            raise Error(self.file,next(x.span for x in explicit_fields if name==x.name or name.startswith(x.name+'.')),
-                                f"explicit return field {name!r} conflicts with the variable discovered by where: declared type(s) {sorted(g.nodes[newid].types)}, discovered type(s) {sorted(g.nodes[oldid].types)}",
-                                g.induced(set(g.nodes))[0])
-                        keep=g.merge(oldid,newid,t.span,self.file); declared[name]=keep
-
-            for rel in [x for x in (t.outputs or []) if isinstance(x,Relation)]:
-                lefts=self.named_members(g,rel.left,rel.span,'return relation left endpoint')
-                rights=self.named_members(g,rel.right,rel.span,'return relation right endpoint')
-                for a in lefts:
-                    for b in rights:
-                        edge=Edge(a,rel.tag,b)
-                        if edge not in g.edges: g.edges.append(edge)
-
-            # Expose user variables (inputs and named where results), plus any explicit
-            # return fields, while the returned graph itself remains the complete
-            # surviving post-where graph selected by the `all` marker.
+            # Expose user variables (inputs and named where results) as return names.
+            # Internal optimizer/call nodes remain part of the returned graph via the
+            # return_all flag, but are intentionally not given public synthetic names.
             outs={}
-            explicit_roots={x.name.split('.',1)[0] for x in explicit_fields}
             for i,n in g.nodes.items():
                 for name in sorted(n.names.get(t.universe,set()),key=lambda z:(len(z),z)):
                     root=name.split('.',1)[0]
-                    if root in visible_roots or root in explicit_roots:
+                    if root in visible_roots:
                         outs.setdefault(name,i)
             return g,ins,outs
 

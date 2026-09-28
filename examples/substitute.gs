@@ -1,6 +1,6 @@
 import gs.impl
+uses Impl
 
-def nat: Impl::nat
 def pair
     x:nat
     y:nat
@@ -9,9 +9,9 @@ return
     y:nat
     x followedby y
 
-def Main
+def main
     p1: pair
-where
-    r3 = Impl::add p1 // the difficulty is that the 'followedby' edge is different
+return all where
+    r3 = Impl::add(p1) // the difficulty is that the 'followedby' edge is different
 
-run Main
+run main

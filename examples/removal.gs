@@ -1,6 +1,6 @@
 import gs.impl
+uses Impl
 
-def nat: Impl::nat
 def pair
     x:nat
     y:nat
@@ -8,17 +8,16 @@ return
     x:nat
     y:nat
     x followedby y
-def keep_left  p:pair return p.a:nat
-def keep_right p:pair return p.b:nat
+def keep_left(p:pair) return p.a:nat
+def keep_right(p:pair) return p.b:nat
 
-def Main
-    p1: pair
-    p2: pair
+def main
+    x: nat
+    y: nat
+    p: pair
     factor: nat
-where
-    r1 = keep_left p1
-    r2 = keep_right p2
-    r3 = Impl::add r1 r2
-    ret = Impl::mul r3 factor
+return all where
+    r3 = Impl::add(keep_left(x,y,x followedby y), keep_right(p))
+    ret = Impl::mul(r3,factor)
 
-run Main
+run main
