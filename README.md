@@ -1,4 +1,4 @@
-# GSlang
+# GraS
 
 *A language for graph substitutions.*
 
@@ -99,6 +99,8 @@ is then unified with the assigned name, to be
 easily referenced.
 
 ```python
+import gs.impl
+universe Impl // directly reuse the types
 def Main(x: nat, y: nat)
 where
     r = add x y
@@ -126,15 +128,16 @@ available function applications.
 
 ```python
 import gs.impl
+import gs.implopt
 
-universe Impl // work within Imp
-def main(x: nat, y: nat, x followedby y)
+def nat: Impl::nat
+def Main(x: nat, y: nat, x followedby y)
 where
-    r = add x y
-    ret = sub r y
-    reduce all optimization_addsub
+    ret = Impl::sub (Impl::add x y) y
+    reduce all Implopt::merge_add
+    reduce all Implopt::optimization_addsub
 
-run main
+run Main
 ```
 
 A function can merge nodes through the following pattern:
