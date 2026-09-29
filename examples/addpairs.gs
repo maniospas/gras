@@ -7,4 +7,3 @@ return all r1 followedby r2 where
     r2 = add(y,z)
 
 run addpairs
-    

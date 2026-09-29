@@ -1,4 +1,4 @@
-import impl
+import gs.impl
 universe Implopt uses Impl
 
 def merge_add

@@ -1,7 +1,6 @@
 universe Numbers
 
-type Nat
-type Float
-type Number: Nat
-type Number: Float
-
+def Nat
+def Float
+def Number: Nat
+def Number: Float

@@ -1,9 +1,7 @@
 import gs.impl
 uses Impl
 
-def pair
-    x:nat
-    y:nat
+def pair (x:nat, y:nat)
 return
     x:nat
     y:nat

@@ -4,7 +4,7 @@
 
 **Author: Emmanouil Krasanakis**
 
-*Disclaimer: The code has mostly been written by ChatGPT, with manual review, refinement, and testing. This is a re-framing of the most significant theory of my PhD some years after its conclusion to a concrete language.*
+*Disclaimer: The code has mostly been written by ChatGPT-5.6 Sol, with manual design, review, refinement, and testing. This is a re-implementation of the most significant theory of my PhD some years after its conclusion in the form of a concrete language.*
 
 
 GraS is a language for proofs using labeled graph
@@ -17,9 +17,15 @@ predicates in their definitions.
 
 ## 🚀 Quickstart
 
-Clone this repository and run  `python gs.py --serve` to 
-open the interactive environment in your browser.
-Start writing your program.
+Clone this repository and compile and run the browser IDE per:
+
+```cmd
+g++ -std=c++20 -O2 -Wall -Wextra -pedantic -pthread gras.cpp -o gras
+./gras --serve
+```
+
+This will print a link that you must open in your browser. Only the
+working directory can be affected by the runtime. Happy onboarding! 🙂
 
 ![examples/preview.png](examples/preview.png)
 
@@ -217,12 +223,36 @@ uses Impl
 def main(x: nat, y: nat)
 return all where
     r = add(x,y)
-    ret = sub(r,y)
+    ret = sub(r,y,r followedby y)
     
 run main
 ```
 
-It has been already mentioned that this calling-like notation
+Arguments can also contain relations that are not already present
+but can be assumed. Also arguments do not have a fixed order, unless
+that order is determined via a relation. Thus, 'r followedby y' is
+what the substraction function -and most functions- expects to determine
+the order of operands. Of course, each function may define different
+relations with different semantic meanings too!
+
+As a shorthand, replace a comma with a relation label
+to create chain of related variables. Here is an example, demonstrating
+convenience for simple functions:
+
+```python
+import gs.impl
+uses Impl
+
+def main(x: nat, y: nat)
+return all where
+    ret = sub(add(x,y) followedby y)
+
+run main
+```
+
+
+
+It has been already mentioned that the calling-like notation
 substitutes subgraphs with one of the same node types
 and a compatible subset of edges. This is the exact mechanism:
 1. Match the nodes in the program's graph.
@@ -327,6 +357,42 @@ b arg1 call
 ```
 
 
+### Theorem proving
+
+Use GraS to prove theorems involving one or multiple universes!
+Here is an example of a proof that all numbers are greater than
+zero in Peano arithmetics. When writing proofs, it is often
+convenient to just transfer all input nodes and relations to the
+output graph; this only adds information. Automate this by adding
+`close` in returns.
+
+```python
+import gs.peano
+uses Peano
+
+def gt_property
+    x: nat
+    y: nat
+    gt: property
+    x satisfies gt
+    x precedes y
+return close // close copies the inputs here (including relations)
+    y satisfies gt
+
+def prove_forall()
+    gt0: property
+    theory: set_theory
+    when:succ
+    theory.0  satisfies gt0
+    when.prev satisfies gt0
+return all where
+    // repeat automatically applied transformations
+    reduce all induction|gt_property
+    // verify that theroy.N satisfies gt0 (error otherwise)
+    reduce verify(theory, gt0)
+```
+
+
 ### Keyword summary
 
 The language recognizes the following keywords.
@@ -338,6 +404,7 @@ uses
 def
 return
 all
+close
 where
 run
 reduce
