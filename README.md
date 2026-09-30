@@ -1,4 +1,4 @@
-# GraS
+# 🌱 GraS
 
 *A language for graph substitutions.*
 
@@ -29,6 +29,107 @@ working directory can be affected by the runtime. Happy onboarding! 🙂
 
 ![examples/preview.png](examples/preview.png)
 
+## 🖥️ A runnable program in the GraS proof machine
+
+GraS uses a concept called *Universes* to indicate different kinds
+of precise or imprecise modeling. Each universe contains types and
+transformations between types; often of the same universe. However,
+you can have cross-universe references (see full documentation for
+details). One standout feature is that there exists an *Impl* universe
+that offers runnable constructs to be executed in a virtual
+machine.
+
+Here is an example program. Mainly, it imports definitions found in
+the *gs.impl* file, uses the *Impl* universe as fallback (so that
+we can write *cat* instead of *Impl::cat*), declares a function,
+and runs it. Click on the green "Run" button in the interface to
+execute the function.
+
+```python
+// examples/helloworld.gs
+import gs.impl
+uses Impl
+
+def main()
+return all where
+    reduce cat("hello" followedby " world!")
+
+run main
+```
+
+
+![examples/preview.png](examples/helloworld.png)
+
+
+Let's unpack the function because it's a bit atypical for a programming
+language; ignoring that we run it later, this is just a type
+substitution function (it's a function because it returns; otherwise
+it would be a type - types cannot run). Firstly, the empty parentheses
+indicate no inputs. When running, any inputs would need to be provided
+by you; they would appear over the run button. Parentheses and comma separators
+are optional for inputs so that you can also opt for declaring each one
+in a separate line.
+
+The pattern `return all where` is basically a `return` segment where we
+declared no outputs manually but instead used `all` to ask GraS to gather
+any necessary outputs automatically given the following `where` segment.
+By the way inputs and outputs include both variables AND RELATIONS between
+them.
+
+We finally have a `where` clause that basically performs substitutions.
+Given that we previously used `all` GraS automatically creates temporary
+output variables for "hello" and " world!". What's the type of these variables?
+This is where the fun begins! They are **both** strings and string
+literals (a string literal is a type whose name is a string).
+Thus, running later interprets this situation as a known return value.
+When using GraS for proofs, you can even have types across different universes
+packed onto the same variable!!
+
+Anyway, `reduce` is simpler. Basically it translates to `[temporary variable] = ...`
+because all calls need to return somewhere. The run will show at the end computational
+outcomes not used elsewhere.
+
+And the actual thing that looks like a function call? That is actually a graph
+substitution mechanism that is performed on the one-edge graph `tmp0 --followedby--> tmp1`
+where *tmp0*,*tmp1* are the temporary variables corresponding to the strings,
+and  *followedby* is an arbitrary edge label, which is needed by the *cat* function.
+Actually, the call is kind of a syntax sugar for the following fully declarative schema.
+In that schema, we pass a bunch of nodes together with supplementary
+relations between them.
+
+```python
+def main()
+return all where
+    tmp0 = "hello"
+    tmp1 = " world!"
+    reduce cat(tmp0, tmp1, tmp0 followedby tmp1)
+```
+
+Ok, what does the simple linear graph we passed as arguments transform to?
+Click on the eye icon on the type/function on the *main* entry on the right
+to see the following graph. Or select the entry to a rather verbose
+textual definition. The transformed graph  basically wires operations and has the correct
+form to be interpreted by `run`; the latter uses only the *arg...*, *call*, and
+*returns* edges. Do note that computational optimizations can also be applied
+as graph transformations.
+
+![examples/preview.png](examples/helloworld.png)
+
+Notice that functions effectively become a kind of execution graph, where
+next steps require the inputs from previous ones. But, wait! We need to get
+some basic sense of *how* the transformation works. We have
+an input graph, an output graph, and some nodes that are matched between the inputs
+and outputs. Think of an isomorphism between tied input and output nodes during substitution,
+though relation handling somewhat less trivial. Briefly (see more later), a GraS call:
+- Matches the input subgraph to nodes and relations of the current definition.
+- Replaces it with the function's return graph. This often contains parts or the whole input graph, but may also remove information too, as if "consuming" it.
+- Reconnects to the surrounding structure, leaving intact relations that were not removed.
+
+That's it for onboarding conceptually. Learn the language properly in the
+short guide below.
+
+
+
 ## 📚 Short guide
 
 ### Universes
@@ -53,7 +154,7 @@ def nat: Impl::nat  // port to this universe
 
 Code within the currently parsed universe to access
 the declarations of one or more others. To avoid the `::`
-syntax prefer the following pattern; that pattern does
+syntax prefer the following pattern; that pattern
 does *not* expose *Impl* through the new universe.
 
 ```python
@@ -68,7 +169,7 @@ universe Myuniverse uses Impl // changing universes resets uses
 
 A type refers to a graph of variables with relations between them.
 Commas and parentheses are optional here so that you can either
-use an one-line function calling syntax or list elements one
+use a one-line function calling syntax or list elements one
 under the other. The example
 declares two fields *x,y*, where fields would be unpacked into their
 sub-components if they were of more complicated type. But here
@@ -231,12 +332,13 @@ run main
 Arguments can also contain relations that are not already present
 but can be assumed. Also arguments do not have a fixed order, unless
 that order is determined via a relation. Thus, 'r followedby y' is
-what the substraction function -and most functions- expects to determine
+a relation that the subtraction function -and most functions with
+order-dependent inputs- expects; it determines
 the order of operands. Of course, each function may define different
 relations with different semantic meanings too!
 
 As a shorthand, replace a comma with a relation label
-to create chain of related variables. Here is an example, demonstrating
+to create a chain of related variables. Here is an example, demonstrating
 convenience for simple functions:
 
 ```python
@@ -252,7 +354,7 @@ run main
 
 
 
-It has been already mentioned that the calling-like notation
+It has already been mentioned that the calling notation
 substitutes subgraphs with one of the same node types
 and a compatible subset of edges. This is the exact mechanism:
 1. Match the nodes in the program's graph.
@@ -272,7 +374,7 @@ ret = mul(add(x,y), factor)
 ```
 
 By the way, you can add relations manually to be consumed immediately
-but the substitution's inputs. Here is an example, where notice how `addpairs`
+by the substitution's inputs. Here is an example, where notice how `addpairs`
 is called to add structure in arguments; the order does not matter unless
 a (partial) order is granted through appropriately-labeled relations.
 
@@ -349,7 +451,7 @@ return
 
 `arg` relations represent a variadic argument route.
 Use `arg0`, `arg1`, etc. for fixed-position arguments.
-Calls implement either of those schema.
+Calls implement either of those schemas.
 
 ``` text
 a arg0 call
@@ -388,7 +490,7 @@ def prove_forall()
 return all where
     // repeat automatically applied transformations
     reduce all induction|gt_property
-    // verify that theroy.N satisfies gt0 (error otherwise)
+    // verify that theory.N satisfies gt0 (error otherwise)
     reduce verify(theory, gt0)
 ```
 

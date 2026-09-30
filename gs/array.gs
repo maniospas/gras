@@ -4,8 +4,6 @@ universe Array
 uses Impl
 def narray
 def farray
-def array:farray
-def array:narray
 
 //  Constructors
 def toarr(a:nat)
@@ -379,4 +377,16 @@ return (
     call returns result,
     a arg0 call,
     b arg1 call
+)
+
+// Map
+
+def fmap(fn:string, lines:sarray)
+return (
+    close,
+    call:"map",
+    result:farray,
+    call returns result,
+    fn arg0 call,
+    lines arg1 call
 )
