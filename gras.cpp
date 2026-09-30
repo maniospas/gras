@@ -145,12 +145,19 @@ namespace gras {
         Pos start{}, end{};
     };
 
+    struct RelatedLocation {
+        std::string label;
+        std::string file;
+        Span span;
+    };
+
     struct Error : std::runtime_error {
         std::string file;
         Span span;
         std::string graph_context;
-        Error(std::string f, Span s, std::string message, std::string graph = {})
-        : std::runtime_error(std::move(message)), file(std::move(f)), span(s), graph_context(std::move(graph)) {}
+        std::vector<RelatedLocation> related;
+        Error(std::string f, Span s, std::string message, std::string graph = {}, std::vector<RelatedLocation> r = {})
+        : std::runtime_error(std::move(message)), file(std::move(f)), span(s), graph_context(std::move(graph)), related(std::move(r)) {}
     };
 
     namespace ansi {
@@ -344,7 +351,7 @@ namespace gras {
 
     enum class Kind : uint8_t {
         Name, String, Rel, Colon, Pipe, Universe, Uses, Def, Return, LPar, RPar,
-        Where, Reduce, Do, Run, Import, All, Close, Eol, Comma, Eof
+        Where, Reduce, Goal, Do, Run, Import, All, Close, Eol, Comma, Eof
     };
     struct Token {
         Kind kind{};
@@ -367,6 +374,7 @@ namespace gras {
             case Kind::RPar: return "rpar";
             case Kind::Where: return "where";
             case Kind::Reduce: return "reduce";
+            case Kind::Goal: return "goal";
             case Kind::Do: return "do";
             case Kind::Run: return "run";
             case Kind::Import: return "import";
@@ -416,9 +424,9 @@ namespace gras {
             }
         }
         Kind keyword(std::string_view s) const {
-            static constexpr std::array<std::pair<std::string_view, Kind>, 11> ks = {{
+            static constexpr std::array<std::pair<std::string_view, Kind>, 12> ks = {{
                     {"universe", Kind::Universe}, {"uses", Kind::Uses}, {"def", Kind::Def},
-                    {"return", Kind::Return}, {"where", Kind::Where}, {"reduce", Kind::Reduce},
+                    {"return", Kind::Return}, {"where", Kind::Where}, {"reduce", Kind::Reduce}, {"goal", Kind::Goal},
                     {"do", Kind::Do}, {"run", Kind::Run}, {"import", Kind::Import}, {"all", Kind::All}, {"close", Kind::Close}
             }};
             for (auto [text, kind] : ks) if (s == text) return kind;
@@ -545,6 +553,8 @@ namespace gras {
         std::vector<Relation> relations;
         std::vector<NameId> function_candidates;
         std::vector<NameId> function_alternatives;
+        std::optional<uint64_t> max_reductions;
+        NameId goal_universe = NoName;
     };
     using Statement = std::variant<Field, Relation>;
     using WhereItem = std::variant<Relation, Reduce>;
@@ -599,6 +609,7 @@ namespace gras {
         std::vector<NameId> uses;
         uint32_t temp = 0;
         std::optional<Mode> segment_group;
+        NameId where_goal = NoName;
         std::function<void(Program&,NameId,Span)> importer;
         std::unordered_map<NameId, size_t> pending_type_uses;
         std::unordered_map<NameId, Span> first_type_use;
@@ -660,6 +671,7 @@ namespace gras {
             program.universes[universe_index].types.push_back(std::move(*type));
             type.reset();
             mode = Mode::Input;
+            where_goal = NoName;
         }
         void open_universe() {
             finish();
@@ -733,7 +745,14 @@ namespace gras {
             if (type->has_where) throw Error(file, token.span, "duplicate 'where'");
             type->has_where = true;
             mode = Mode::Where;
+            where_goal = NoName;
             group_segment(Mode::Where);
+        }
+        void goal_statement() {
+            Token token = take();
+            if (!type || mode != Mode::Where) throw Error(file, token.span, "'goal' is only valid inside a where block");
+            Token universe = expect({Kind::Name});
+            where_goal = universe.text;
         }
         NameId temporary() {
             return names.intern("__tmp" + std::to_string(temp++));
@@ -821,12 +840,32 @@ namespace gras {
             if (args.empty()) throw Error(file, fn.span, "function call '" + std::string(names.str(fn.text)) + "' requires at least one node argument inside parentheses");
             Span call_span{start, rp.span.end};
             require_where_target(ret, call_span, fn.text);
-            current().where.push_back(Reduce{ret, fn.text, std::move(args), call_span, false, std::move(relations), {}, {fn.text}});
+            current().where.push_back(Reduce{ret, fn.text, std::move(args), call_span, false, std::move(relations), {}, {fn.text}, std::nullopt, NoName});
+        }
+        static bool nat_reduction_limit(std::string_view text, uint64_t& value) {
+            if (text.empty() || !std::all_of(text.begin(), text.end(), [](unsigned char c){ return std::isdigit(c); })) return false;
+            auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+            return ec == std::errc{} && ptr == text.data() + text.size();
         }
         void reduce_statement() {
             Token token = take();
+            std::optional<uint64_t> limit;
+            bool repeated = false;
             if (peek().kind == Kind::All) {
                 take();
+                repeated = true;
+            } else if (peek().kind == Kind::Name) {
+                uint64_t parsed = 0;
+                std::string_view raw = names.str(peek().text);
+                if (nat_reduction_limit(raw, parsed)) {
+                    take();
+                    repeated = true;
+                    limit = parsed;
+                } else if (is_numeric_literal(raw)) {
+                    throw Error(file, peek().span, "reduction limit must be a natural-number literal written with decimal digits only");
+                }
+            }
+            if (repeated) {
                 Token fn = expect({Kind::Name});
                 std::vector<NameId> alternatives{fn.text};
                 Span span{token.span.start, fn.span.end};
@@ -836,7 +875,9 @@ namespace gras {
                     alternatives.push_back(alternative.text);
                     span.end = alternative.span.end;
                 }
-                Reduce reduction{temporary(), fn.text, {}, span, true, {}, {}, std::move(alternatives)};
+                Reduce reduction{temporary(), fn.text, {}, span, true, {}, {}, std::move(alternatives), std::nullopt, NoName};
+                reduction.max_reductions = limit;
+                reduction.goal_universe = where_goal;
                 current().where.push_back(std::move(reduction));
                 return;
             }
@@ -881,7 +922,16 @@ namespace gras {
                     types.push_back(alternative.text);
                 }
                 auto& target = mode == Mode::Input ? type->inputs : type->outputs;
-                for (auto& s : target) if (auto* f = std::get_if<Field>(&s); f && f->name == left.text) throw Error(file, left.span, "duplicate field '" + std::string(names.str(left.text)) + "'");
+                for (auto& s : target) {
+                    auto* f = std::get_if<Field>(&s);
+                    if (!f || f->name != left.text) continue;
+                    for (NameId existing : f->types) for (NameId incoming : types) {
+                        if (existing == incoming) {
+                            throw Error(file, left.span, "duplicate field '" + std::string(names.str(left.text)) +
+                                "' with type '" + std::string(names.str(incoming)) + "'");
+                        }
+                    }
+                }
                 target.push_back(Field{left.text, std::move(types), {left.span.start, tokens_[i-1].span.end}});
                 return;
             }
@@ -937,6 +987,9 @@ namespace gras {
                     break;
                     case Kind::Reduce: if (mode != Mode::Where) throw Error(file, peek().span, "runaway 'reduce'");
                     else reduce_statement();
+                    break;
+                    case Kind::Goal: if (mode != Mode::Where) throw Error(file, peek().span, "runaway 'goal'");
+                    else goal_statement();
                     break;
                     case Kind::Do: throw Error(file, peek().span, "'do' is not implemented");
                     case Kind::Import: {
@@ -1134,27 +1187,44 @@ namespace gras {
             for (auto& u : program.universes) for (auto& t : u.types) {
                 std::string origin = t.source_file.empty() ? file : t.source_file;
                 std::unordered_map<NameId, std::vector<NameId>> union_cache;
-                for (auto* vec : {&t.inputs, &t.outputs}) for (auto& s : *vec) if (auto* f = std::get_if<Field>(&s)) {
-                    if (f->types.size() > 1) {
-                        std::vector<std::string> raw_parts;
-                        for (NameId n : f->types) raw_parts.emplace_back(names.str(n));
-                        f->union_name = names.intern(join(raw_parts, "|"));
-                        auto cached = union_cache.find(f->union_name);
-                        if (cached != union_cache.end()) {
-                            f->types = cached->second;
+                for (auto* vec : {&t.inputs, &t.outputs}) {
+                    std::unordered_map<NameId, std::set<NameId>> declared_types;
+                    for (auto& s : *vec) if (auto* f = std::get_if<Field>(&s)) {
+                        if (f->types.size() > 1) {
+                            std::vector<std::string> raw_parts;
+                            for (NameId n : f->types) raw_parts.emplace_back(names.str(n));
+                            f->union_name = names.intern(join(raw_parts, "|"));
+                            auto cached = union_cache.find(f->union_name);
+                            if (cached != union_cache.end()) {
+                                f->types = cached->second;
+                            } else {
+                                for (NameId& n : f->types) n = resolve_type(n, t.universe, t.uses, f->span,
+                                    "type of variable '" + std::string(names.str(f->name)) + "'", types, origin);
+                                union_cache.emplace(f->union_name, f->types);
+                            }
                         } else {
                             for (NameId& n : f->types) n = resolve_type(n, t.universe, t.uses, f->span,
                                 "type of variable '" + std::string(names.str(f->name)) + "'", types, origin);
-                            union_cache.emplace(f->union_name, f->types);
                         }
-                    } else {
-                        for (NameId& n : f->types) n = resolve_type(n, t.universe, t.uses, f->span,
-                            "type of variable '" + std::string(names.str(f->name)) + "'", types, origin);
+                        for (NameId n : f->types) {
+                            if (!types.count(n)) throw Error(origin, f->span,
+                                "unknown type '" + std::string(names.str(n)) + "' used by variable '" + std::string(names.str(f->name)) + "'");
+                            if (!declared_types[f->name].insert(n).second) {
+                                throw Error(origin, f->span, "duplicate field '" + std::string(names.str(f->name)) +
+                                    "' with type '" + std::string(names.str(n)) + "'");
+                            }
+                        }
                     }
-                    for (NameId n : f->types) if (!types.count(n)) throw Error(origin, f->span,
-                        "unknown type '" + std::string(names.str(n)) + "' used by variable '" + std::string(names.str(f->name)) + "'");
                 }
                 for (auto& w : t.where) if (auto* red = std::get_if<Reduce>(&w)) {
+                    if (red->goal_universe != NoName) {
+                        bool found_goal = std::any_of(program.universes.begin(), program.universes.end(), [&](const Universe& candidate) {
+                            return candidate.name == red->goal_universe;
+                        });
+                        if (!found_goal) {
+                            throw Error(origin, red->span, "unknown reduction goal universe '" + std::string(names.str(red->goal_universe)) + "'");
+                        }
+                    }
                     std::vector<NameId> selectors = red->function_alternatives;
                     if (selectors.empty()) selectors.push_back(red->function);
                     std::vector<NameId> resolved;
@@ -1426,7 +1496,9 @@ namespace gras {
             if (!has(a)||!has(b)) throw std::logic_error("merge dead node");
             Node& x=nodes[a];
             Node& y=nodes[b];
-            if (x.types!=y.types) throw Error(std::move(file),span,"cannot merge variables: their type sets differ ("+types->format(x.types)+" vs "+types->format(y.types)+"). Identity merges require exactly compatible types");
+            (void)span;
+            (void)file;
+            x.types |= y.types;
             for (auto al:y.names) add_alias(a,al.theory,al.name);
             for (NameId n:y.input_names) add_input_name(a,n);
             for (auto& e:edges) {
@@ -1443,8 +1515,8 @@ namespace gras {
             std::unordered_map<NodeId,NodeId> remap;
             for(NodeId old:wanted) if(has(old)){
                 NodeId neu=g.add_node(nodes[old].types);
-                g.nodes[neu].names=nodes[old].names;
-                g.nodes[neu].input_names=nodes[old].input_names;
+                for (const Alias& alias : nodes[old].names) g.add_alias(neu, alias.theory, alias.name);
+                for (NameId input_name : nodes[old].input_names) g.add_input_name(neu, input_name);
                 remap[old]=neu;
             }
             for (auto& e:edges) {
@@ -1503,6 +1575,21 @@ namespace gras {
         NameId n=best_name_id(g,i);
         return n==NoName?"#"+std::to_string(i):std::string(g.names->str(n));
     }
+    static bool is_temporary_name(std::string_view name) {
+        return name.starts_with("__tmp") || name.find(".__tmp") != std::string_view::npos;
+    }
+    static std::vector<std::string> temporary_alias_labels(const Graph& g, NodeId i, std::string_view displayed = {}) {
+        std::vector<std::string> out;
+        if (!g.has(i)) return out;
+        for (const Alias& alias : g.nodes[i].names) {
+            if (alias.name == NoName) continue;
+            std::string value(g.names->str(alias.name));
+            if (!is_temporary_name(value) || value == displayed) continue;
+            if (std::find(out.begin(), out.end(), value) == out.end()) out.push_back(std::move(value));
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
     static std::string graph_diagnostic(const Graph& g){
         std::vector<std::string> vars,rels;
         for(NodeId i:g.ids())vars.push_back(best_name(g,i)+" : "+g.types->format(g.nodes[i].types));
@@ -1512,20 +1599,24 @@ namespace gras {
 
     static std::optional<NameId> call_name_id(const Graph& g,NodeId id){
         if (!g.has(id)) return std::nullopt;
-        std::map<std::string, NameId> literals;
+        std::map<std::string, NameId> implementations;
+        std::optional<NameId> builtin;
         for (const Alias& alias : g.nodes[id].names) {
             std::string_view q = g.names->str(alias.name);
             if (!is_string_literal(q)) continue;
-            std::string raw(literal_text(q));
-            literals.emplace(raw, alias.name);
+            size_t p=q.rfind("::");
+            std::string u=p==std::string_view::npos?"Impl":std::string(q.substr(0,p));
+            std::string name=unquote_string(std::string(literal_text(q)));
+            NameId implementation=g.names->intern(u+"::"+name);
+            implementations.emplace(std::string(q), implementation);
+            if (implementation <= N_Impl_ftos) {
+                if (builtin && *builtin != implementation) return std::nullopt;
+                builtin = implementation;
+            }
         }
-        if (literals.size() != 1) return std::nullopt;
-        NameId literal = literals.begin()->second;
-        std::string_view q = g.names->str(literal);
-        size_t p=q.rfind("::");
-        std::string u=p==std::string_view::npos?"Impl":std::string(q.substr(0,p));
-        std::string name=unquote_string(std::string(literal_text(q)));
-        return g.names->intern(u+"::"+name);
+        if (builtin) return builtin;
+        if (implementations.size() != 1) return std::nullopt;
+        return implementations.begin()->second;
     }
 
     struct Builder {
@@ -1536,9 +1627,10 @@ namespace gras {
         TypeRegistry& registry;
         std::unordered_map<NameId,std::vector<const Type*>> groups;
         std::unordered_map<NameId,const Type*> selected;
+        std::vector<std::string>* reduction_log = nullptr;
 
-        Builder(std::string f,Program&p,Interner&n,TypeRegistry&r,std::unordered_map<NameId,const Type*> sel={})
-        :file(std::move(f)),program(p),names(n),registry(r),selected(std::move(sel)){
+        Builder(std::string f,Program&p,Interner&n,TypeRegistry&r,std::unordered_map<NameId,const Type*> sel={},std::vector<std::string>* log=nullptr)
+        :file(std::move(f)),program(p),names(n),registry(r),selected(std::move(sel)),reduction_log(log){
             for(auto&u:program.universes)for(auto&t:u.types)if(!t.union_template)groups[t.full].push_back(&t);
             if(selected.empty())for(auto&[k,v]:groups)selected[k]=v.back();
         }
@@ -1616,6 +1708,17 @@ namespace gras {
             if(in_stack(t.full,stack))throw Error(file,t.span,"recursive type "+std::string(names.str(t.full)));
             const auto& ss=output?t.outputs:t.inputs;
             NodeMap out;
+            auto bind_name = [&](NameId name, NodeId id, Span span) {
+                auto it = out.find(name);
+                if (it == out.end() || !g.has(it->second)) {
+                    out[name] = id;
+                    return id;
+                }
+                if (it->second == id) return id;
+                NodeId keep = g.merge(it->second, id, span, file);
+                it->second = keep;
+                return keep;
+            };
             if(!output&&ss.size()==1){
                 if(auto*x=std::get_if<Field>(&ss[0]);x&&names.str(x->name)=="$"){
                     NameId target=x->types.at(0);
@@ -1627,7 +1730,7 @@ namespace gras {
                         NameId base = is_literal(names.str(target)) ? literal_base_type(names, target) : NoName;
                         NodeId id=g.add_node(registry.bit(base == NoName ? target : base),theory,nm);
                         if (base != NoName) g.add_alias(id, theory, target);
-                        out[nm]=id;
+                        bind_name(nm, id, x->span);
                         return out;
                     }
                     stack.push_back(t.full);
@@ -1651,14 +1754,52 @@ namespace gras {
                 if(bits){
                     NodeId id=g.add_node(bits,theory,nm);
                     for (NameId literal : literal_aliases) g.add_alias(id, theory, literal);
-                    out[nm]=id;
+                    bind_name(nm, id, x->span);
                 }for(NameId child:structured){
                     auto it=selected.find(child);
                     if(it==selected.end())throw Error(file,x->span,"unknown type '"+std::string(names.str(child))+"'");
+                    const Type& chosen=*it->second;
                     auto ns=stack;
                     ns.push_back(t.full);
-                    NodeMap sub=add_shape(g,*it->second,nm,theory,it->second->function(),std::move(ns));
-                    out.insert(sub.begin(),sub.end());
+                    if(chosen.function()&&chosen.return_all){
+                        // A return-all function has no useful syntactic output field list:
+                        // its type is the graph inferred by build_function().  Import the
+                        // complete returned graph under this field prefix and preserve every
+                        // relation between imported nodes.
+                        Builder nested(file,program,names,registry,selected);
+                        FunctionBuild built=nested.build_function(chosen);
+                        std::set<NodeId> returned;
+                        for(const auto& [return_name,old_id]:built.outputs){
+                            (void)return_name;
+                            if(built.graph.has(old_id))returned.insert(old_id);
+                        }
+                        std::unordered_map<NodeId,NodeId> remap;
+                        for(NodeId old_id:returned){
+                            NodeId new_id=g.add_node(built.graph.nodes[old_id].types);
+                            remap[old_id]=new_id;
+                            for(const Alias& alias:built.graph.nodes[old_id].names){
+                                if(alias.name==NoName)continue;
+                                if(is_literal(names.str(alias.name))){
+                                    g.add_alias(new_id,alias.theory,alias.name);
+                                }else{
+                                    NameId prefixed=qualify(nm,alias.name);
+                                    NameId alias_theory=alias.theory==chosen.universe?theory:alias.theory;
+                                    g.add_alias(new_id,alias_theory,prefixed);
+                                    if(alias.theory==chosen.universe)bind_name(prefixed,new_id,x->span);
+                                }
+                            }
+                            for(NameId input_name:built.graph.nodes[old_id].input_names){
+                                g.add_input_name(new_id,qualify(nm,input_name));
+                            }
+                        }
+                        for(const Edge& edge:built.graph.edges){
+                            auto left=remap.find(edge.left),right=remap.find(edge.right);
+                            if(left!=remap.end()&&right!=remap.end())g.add_edge({left->second,edge.tag,right->second});
+                        }
+                    }else{
+                        NodeMap sub=add_shape(g,chosen,nm,theory,chosen.function(),std::move(ns));
+                        for (auto [sub_name, sub_id] : sub) bind_name(sub_name, sub_id, x->span);
+                    }
             }}
             for(auto&s:ss){
                 auto*r=std::get_if<Relation>(&s);
@@ -1708,10 +1849,22 @@ namespace gras {
                 }else if(!t.starts_with("!"))out.insert(e.tag);
             }return out;
         }
-        bool compatible_edges(const Graph&a,const Graph&b,NodeId x,NodeId xx,NodeId y,NodeId yy)const{auto expected=edge_sig(a,x,xx,false),actual=edge_sig(b,y,yy,false);
-            if(!std::includes(actual.begin(),actual.end(),expected.begin(),expected.end()))return false;
+        bool edge_tag_matches(NameId expected,NameId actual)const{
+            if(expected==actual)return true;
+            std::string_view wanted=names.str(expected);
+            if(wanted!="arg")return false;
+            std::string_view got=names.str(actual);
+            return got.size()>3&&got.starts_with("arg")&&std::all_of(got.begin()+3,got.end(),[](char c){return c>='0'&&c<='9';});
+        }
+        bool compatible_edges(const Graph&a,const Graph&b,NodeId x,NodeId xx,NodeId y,NodeId yy)const{
+            auto expected=edge_sig(a,x,xx,false),actual=edge_sig(b,y,yy,false);
+            auto matches_tag=[&](NameId wanted){
+                for(NameId got:actual)if(edge_tag_matches(wanted,got))return true;
+                return false;
+            };
+            for(NameId wanted:expected)if(!matches_tag(wanted))return false;
             auto neg=edge_sig(a,x,xx,true);
-            for(NameId n:neg)if(actual.count(n))return false;
+            for(NameId wanted:neg)if(matches_tag(wanted))return false;
             return true;
         }
 
@@ -1728,13 +1881,49 @@ namespace gras {
             auto have = literal_aliases(actual, y);
             return std::includes(have.begin(), have.end(), need.begin(), need.end());
         }
+        std::string alias_key(const Alias& alias) const {
+            if (alias.name == NoName) return {};
+            std::string_view raw = names.str(alias.name);
+            return is_literal(raw) ? std::string(literal_text(raw)) : std::string(raw);
+        }
+        bool aliases_overlap(const Graph& a, NodeId x, const Graph& b, NodeId y) const {
+            std::set<std::string> left;
+            for (const Alias& alias : a.nodes[x].names) {
+                std::string key = alias_key(alias);
+                if (!key.empty()) left.insert(std::move(key));
+            }
+            for (const Alias& alias : b.nodes[y].names) {
+                std::string key = alias_key(alias);
+                if (!key.empty() && left.count(key)) return true;
+            }
+            return false;
+        }
+        bool node_types_overlap(const Graph& a, NodeId x, const Graph& b, NodeId y) const {
+            return (a.nodes[x].types & b.nodes[y].types) != 0;
+        }
 
-        std::optional<std::unordered_map<NodeId,NodeId>> iso_impl(const Graph&a,const Graph&b,const std::unordered_map<NodeId,std::set<NodeId>>*allowed,bool subgraph){
+        std::string match_signature(const std::unordered_map<NodeId,NodeId>& match) const {
+            std::vector<std::pair<NodeId,NodeId>> pairs(match.begin(), match.end());
+            std::sort(pairs.begin(), pairs.end());
+            std::vector<std::string> parts;
+            parts.reserve(pairs.size());
+            for (auto [a,b] : pairs) parts.push_back(std::to_string(a) + ">" + std::to_string(b));
+            return join(parts, ",");
+        }
+
+        std::optional<std::unordered_map<NodeId,NodeId>> iso_impl(
+            const Graph&a,const Graph&b,const std::unordered_map<NodeId,std::set<NodeId>>*allowed,bool subgraph,
+            const std::set<std::string>* forbidden=nullptr){
             auto aids=a.ids(),bids=b.ids();
             if(!subgraph&&aids.size()!=bids.size())return std::nullopt;
             std::unordered_map<NodeId,std::vector<NodeId>> cand;
             for(NodeId x:aids){
-                for(NodeId y:bids)if(a.nodes[x].types==b.nodes[y].types&&literal_constraints_match(a,x,b,y)&&(!allowed||!allowed->count(x)||allowed->at(x).count(y)))cand[x].push_back(y);
+                for(NodeId y:bids){
+                    bool type_match = node_types_overlap(a, x, b, y);
+                    bool alias_match = subgraph && aliases_overlap(a, x, b, y);
+                    if((type_match || alias_match) && literal_constraints_match(a,x,b,y) &&
+                       (!allowed||!allowed->count(x)||allowed->at(x).count(y))) cand[x].push_back(y);
+                }
                 if(cand[x].empty())return std::nullopt;
             }
             std::sort(aids.begin(),aids.end(),[&](NodeId x,NodeId z){
@@ -1743,7 +1932,7 @@ namespace gras {
             std::unordered_map<NodeId,NodeId> m;
             std::set<NodeId> used;
             std::function<bool(size_t)> dfs=[&](size_t idx){
-                if(idx==aids.size())return true;
+                if(idx==aids.size())return !forbidden || !forbidden->count(match_signature(m));
                 NodeId x=aids[idx];
                 for(NodeId y:cand[x]){
                     if(used.count(y))continue;
@@ -1763,10 +1952,25 @@ namespace gras {
             return m;
         }
         std::optional<std::unordered_map<NodeId,NodeId>> isomorphism(const Graph&a,const Graph&b,const std::unordered_map<NodeId,std::set<NodeId>>*allowed=nullptr){
-            return iso_impl(a,b,allowed,false);
+            return iso_impl(a,b,allowed,false,nullptr);
         }
-        std::optional<std::unordered_map<NodeId,NodeId>> subgraph_isomorphism(const Graph&a,const Graph&b){
-            return iso_impl(a,b,nullptr,true);
+        std::optional<std::unordered_map<NodeId,NodeId>> subgraph_isomorphism(
+            const Graph&a,const Graph&b,const std::set<std::string>*forbidden=nullptr){
+            return iso_impl(a,b,nullptr,true,forbidden);
+        }
+        std::vector<std::unordered_map<NodeId,NodeId>> subgraph_isomorphisms(
+            const Graph& a, const Graph& b, const std::set<std::string>* forbidden=nullptr) {
+            std::set<std::string> blocked;
+            if (forbidden) blocked = *forbidden;
+            std::vector<std::unordered_map<NodeId,NodeId>> out;
+            for (;;) {
+                auto match = subgraph_isomorphism(a, b, &blocked);
+                if (!match) break;
+                std::string signature = match_signature(*match);
+                if (!blocked.insert(signature).second) break;
+                out.push_back(std::move(*match));
+            }
+            return out;
         }
 
         std::string node_description(const Graph& g, NodeId id) const {
@@ -1797,7 +2001,7 @@ namespace gras {
             for (NodeId e : expected_ids) {
                 for (NodeId a : actual_ids) {
                     if (used_actual.count(a)) continue;
-                    if (expected.nodes[e].types != actual.nodes[a].types) continue;
+                    if (!node_types_overlap(expected, e, actual, a) && !aliases_overlap(expected, e, actual, a)) continue;
                     if (!literal_constraints_match(expected, e, actual, a)) continue;
                     pairing[e] = a;
                     used_actual.insert(a);
@@ -1910,24 +2114,105 @@ namespace gras {
         };
         FunctionBuild build_function(const Type&t);
         void apply_reduce(Graph&g,const Type&owner,const Reduce&r,std::optional<std::set<NodeId>> selected_override=std::nullopt,const Type* forced_fn=nullptr,const std::unordered_map<NodeId,NodeId>* forced_match=nullptr);
-        std::string graph_shape(const Graph&g){
+        static constexpr double GoalPenaltyLambda = 0.1;
+        bool node_has_universe_alias(const Graph& graph, NodeId id, NameId universe) const {
+            if (!graph.has(id) || universe == NoName) return false;
+            for (const Alias& alias : graph.nodes[id].names) if (alias.theory == universe) return true;
+            return false;
+        }
+        struct GoalScore {
+            size_t wanted = 0;
+            size_t unwanted = 0;
+            double value = 0.0;
+        };
+        GoalScore goal_relation_score(const Graph& graph, NameId universe) const {
+            GoalScore score;
+            for (const Edge& edge : graph.edges) {
+                if (!graph.has(edge.left) || !graph.has(edge.right)) continue;
+                bool left_inside = node_has_universe_alias(graph, edge.left, universe);
+                bool right_inside = node_has_universe_alias(graph, edge.right, universe);
+                if (left_inside && right_inside) ++score.wanted;
+                else ++score.unwanted;
+            }
+            score.value = static_cast<double>(score.wanted) - GoalPenaltyLambda * static_cast<double>(score.unwanted);
+            return score;
+        }
+        static std::string score_text(double value) {
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(1) << value;
+            return out.str();
+        }
+        std::string graph_shape(const Graph&g, NameId alias_universe=NoName){
+            auto node_shape = [&](NodeId id) {
+                std::string out = std::to_string(g.nodes[id].types);
+                if (alias_universe != NoName) {
+                    std::vector<std::string> aliases;
+                    for (const Alias& alias : g.nodes[id].names) {
+                        if (alias.theory != alias_universe || alias.name == NoName) continue;
+                        aliases.push_back(std::to_string(alias.name));
+                    }
+                    std::sort(aliases.begin(), aliases.end());
+                    aliases.erase(std::unique(aliases.begin(), aliases.end()), aliases.end());
+                    out += "[" + join(aliases, ",") + "]";
+                }
+                return out;
+            };
             std::vector<std::string> ns,es;
-            for(NodeId i:g.ids())ns.push_back(std::to_string(g.nodes[i].types));
+            std::unordered_map<NodeId,std::string> shapes;
+            for(NodeId i:g.ids()){
+                shapes[i]=node_shape(i);
+                ns.push_back(shapes[i]);
+            }
             std::sort(ns.begin(),ns.end());
-            for(auto&e:g.edges)if(g.has(e.left)&&g.has(e.right))es.push_back(std::to_string(g.nodes[e.left].types)+":"+std::string(names.str(e.tag))+":"+std::to_string(g.nodes[e.right].types));
+            for(auto&e:g.edges)if(g.has(e.left)&&g.has(e.right))es.push_back(shapes[e.left]+":"+std::string(names.str(e.tag))+":"+shapes[e.right]);
             std::sort(es.begin(),es.end());
             return join(ns,",")+"|"+join(es,",");
         }
+        void log_reduction(std::string message) {
+            if (reduction_log) reduction_log->push_back(std::move(message));
+        }
+        std::string reduction_target(const Graph& graph, const std::unordered_map<NodeId,NodeId>& match) const {
+            std::vector<std::string> parts;
+            std::set<NodeId> seen;
+            for (auto [expected, actual] : match) {
+                (void)expected;
+                if (!graph.has(actual) || !seen.insert(actual).second) continue;
+                parts.push_back(node_description(graph, actual));
+            }
+            std::sort(parts.begin(), parts.end());
+            return parts.empty() ? "<empty>" : join(parts, ", ");
+        }
         void apply_all(Graph&g,const Type&owner,const Reduce&r){
-            std::set<std::string> seen;
-            for(size_t round=0;;++round){
-                std::string shape=graph_shape(g);
-                if(seen.count(shape))return;
-                seen.insert(shape);
-                struct Choice{size_t rarity;
-                    const Type*fn;
-                    std::unordered_map<NodeId,NodeId>match;
+            if (r.max_reductions && *r.max_reductions == 0) {
+                log_reduction("BEGIN|reduce 0 " + std::string(names.str(r.function)) + "|limit is zero; no reductions applied");
+                return;
+            }
+            std::string reduce_name(literal_text(names.str(r.function)));
+            log_reduction(std::string("BEGIN|") + (r.max_reductions ? ("reduce " + std::to_string(*r.max_reductions)) : "reduce all") + " " + reduce_name + (r.goal_universe != NoName ? ("|goal " + std::string(names.str(r.goal_universe)) + " · score = wanted − 0.1 × unwanted") : ""));
+            std::set<std::string> seen_states{graph_shape(g, r.goal_universe)};
+            std::unordered_map<std::string,std::set<std::string>> stalled;
+            auto selection_key = [&](const Type* fn, const std::unordered_map<NameId,const Type*>& sel) {
+                std::vector<std::string> parts;
+                parts.push_back(std::to_string(fn->uid));
+                for (auto [name, type] : sel) {
+                    parts.push_back(std::to_string(name) + "=" + std::to_string(type ? type->uid : 0));
+                }
+                std::sort(parts.begin() + 1, parts.end());
+                return join(parts, "|");
+            };
+            size_t applied = 0;
+            size_t attempt = 0;
+            while (!r.max_reductions || applied < *r.max_reductions) {
+                struct Choice {
+                    size_t rarity = std::numeric_limits<size_t>::max();
+                    const Type* fn = nullptr;
+                    std::unordered_map<NodeId,NodeId> match;
                     std::unordered_map<NameId,const Type*> sel;
+                    std::string key;
+                    double score = -std::numeric_limits<double>::infinity();
+                    size_t wanted = 0;
+                    size_t unwanted = 0;
+                    std::optional<Graph> result;
                 };
                 std::vector<Choice> choices;
                 auto overloads=function_overloads(r);
@@ -1937,29 +2222,112 @@ namespace gras {
                         Builder cb(file,program,names,registry,sel);
                         auto[expected,emap]=cb.function_input(*fn);
                         (void)emap;
-                        auto match=cb.subgraph_isomorphism(expected,g);
-                        if(match){
+                        std::string key=selection_key(fn,sel);
+                        std::vector<std::unordered_map<NodeId,NodeId>> matches;
+                        if (r.goal_universe != NoName) {
+                            matches = cb.subgraph_isomorphisms(expected,g,&stalled[key]);
+                        } else {
+                            auto match=cb.subgraph_isomorphism(expected,g,&stalled[key]);
+                            if(match)matches.push_back(std::move(*match));
+                        }
+                        for (auto& match : matches) {
                             size_t rarity=std::numeric_limits<size_t>::max();
                             for(NodeId x:expected.ids()){
                                 size_t c=0;
-                                for(NodeId y:g.ids())if(g.nodes[y].types==expected.nodes[x].types)++c;
+                                for(NodeId y:g.ids())if(cb.node_types_overlap(expected,x,g,y)||cb.aliases_overlap(expected,x,g,y))++c;
                                 rarity=std::min(rarity,c);
                             }
-                            choices.push_back({rarity,fn,*match,std::move(sel)});
+                            Choice choice;
+                            choice.rarity = rarity;
+                            choice.fn = fn;
+                            choice.match = match;
+                            choice.sel = sel;
+                            choice.key = key;
+
+                            if (r.goal_universe != NoName) {
+                                Graph trial = g;
+                                Reduce tmp{names.intern(std::string(names.str(r.ret))+std::to_string(attempt)),r.function,{},r.span,false,{},r.function_candidates,r.function_alternatives,std::nullopt,NoName};
+                                std::set<NodeId> ids;
+                                for(auto[k,v]:choice.match){(void)k; ids.insert(v);}
+                                Builder chosen(file,program,names,registry,choice.sel);
+                                std::string before_shape=graph_shape(trial, r.goal_universe);
+                                chosen.apply_reduce(trial,owner,tmp,ids,choice.fn,&choice.match);
+                                std::string after_shape=graph_shape(trial, r.goal_universe);
+                                if(after_shape==before_shape){
+                                    stalled[choice.key].insert(match_signature(choice.match));
+                                    continue;
+                                }
+                                if(seen_states.count(after_shape)){
+                                    stalled[choice.key].insert(match_signature(choice.match));
+                                    continue;
+                                }
+                                GoalScore score = goal_relation_score(trial, r.goal_universe);
+                                choice.score = score.value;
+                                choice.wanted = score.wanted;
+                                choice.unwanted = score.unwanted;
+                                choice.result = std::move(trial);
+                            }
+                            choices.push_back(std::move(choice));
                         }
                     }
-                }if(choices.empty())return;
-                std::sort(choices.begin(),choices.end(),[](auto&a,auto&b){
-                    return a.rarity<b.rarity;});
-                Reduce tmp{names.intern(std::string(names.str(r.ret))+std::to_string(round)),r.function,{},r.span,false,{},r.function_candidates,r.function_alternatives};
-                std::set<NodeId> ids;
-                for(auto[k,v]:choices[0].match){
-                    (void)k;
-                    ids.insert(v);
                 }
-                Builder chosen(file,program,names,registry,choices[0].sel);
-                chosen.apply_reduce(g,owner,tmp,ids,choices[0].fn,&choices[0].match);
-        }}
+                if(choices.empty()){
+                    log_reduction("STOP|no further applicable reduction");
+                    return;
+                }
+                if (r.goal_universe != NoName) {
+                    std::sort(choices.begin(),choices.end(),[&](const Choice&a,const Choice&b){
+                        if(a.score!=b.score)return a.score>b.score;
+                        if(a.rarity!=b.rarity)return a.rarity<b.rarity;
+                        if(a.fn->uid!=b.fn->uid)return a.fn->uid<b.fn->uid;
+                        return match_signature(a.match)<match_signature(b.match);
+                    });
+                    if (reduction_log) {
+                        std::set<std::tuple<std::string,size_t,size_t,std::string>> logged;
+                        for (const Choice& candidate : choices) {
+                            std::string fn_name(names.str(candidate.fn->name));
+                            std::string total=score_text(candidate.score);
+                            if(!logged.insert({fn_name,candidate.wanted,candidate.unwanted,total}).second)continue;
+                            log_reduction("CANDIDATE|" + fn_name + "|" + std::to_string(candidate.wanted) + "|" + std::to_string(candidate.unwanted) + "|" + total);
+                        }
+                    }
+                    Choice choice=std::move(choices.front());
+                    log_reduction("APPLY|" + std::to_string(applied + 1) + "|" + std::string(names.str(choice.fn->name)) + "|" + std::to_string(choice.wanted) + "|" + std::to_string(choice.unwanted) + "|" + score_text(choice.score));
+                    g=std::move(*choice.result);
+                    ++applied;
+                    ++attempt;
+                    seen_states.insert(graph_shape(g, r.goal_universe));
+                    stalled.clear();
+                    continue;
+                }
+
+                std::sort(choices.begin(),choices.end(),[](auto&a,auto&b){return a.rarity<b.rarity;});
+                Choice choice=std::move(choices.front());
+                log_reduction("TRY|" + std::to_string(applied + 1) + "|" + std::string(names.str(choice.fn->name)));
+                std::string before_shape=graph_shape(g, r.goal_universe);
+                Reduce tmp{names.intern(std::string(names.str(r.ret))+std::to_string(attempt)),r.function,{},r.span,false,{},r.function_candidates,r.function_alternatives,std::nullopt,NoName};
+                std::set<NodeId> ids;
+                for(auto[k,v]:choice.match){(void)k; ids.insert(v);}
+                Builder chosen(file,program,names,registry,choice.sel);
+                chosen.apply_reduce(g,owner,tmp,ids,choice.fn,&choice.match);
+                std::string after_shape=graph_shape(g, r.goal_universe);
+                ++attempt;
+                if(after_shape==before_shape){
+                    log_reduction("SKIP|selected application made no graph change");
+                    stalled[choice.key].insert(match_signature(choice.match));
+                    continue;
+                }
+                ++applied;
+                log_reduction("DONE|" + std::to_string(applied));
+                if(seen_states.count(after_shape)){
+                    log_reduction("STOP|graph state repeated");
+                    return;
+                }
+                seen_states.insert(after_shape);
+                stalled.clear();
+            }
+            if (r.max_reductions && applied >= *r.max_reductions) log_reduction("STOP|reduction limit " + std::to_string(*r.max_reductions) + " reached");
+        }
     };
 
 
@@ -2004,8 +2372,7 @@ namespace gras {
                         r.function_candidates=std::move(families);
                         r.function=r.function_candidates.front();
                     }
-                    std::string_view rr=names.str(r.ret);
-                    if(!r.all&&!rr.starts_with("__tmp"))visible.insert(root_name(r.ret));
+                    if(!r.all)visible.insert(root_name(r.ret));
                     if(r.all)apply_all(g,t,r);
                     else apply_reduce(g,t,r);
                 }
@@ -2037,7 +2404,6 @@ namespace gras {
                         break;
                     }for(NodeId old:others){
                         if(!g.has(newid)||!g.has(old))continue;
-                        if(g.nodes[newid].types!=g.nodes[old].types)throw Error(file,t.span,"explicit return field '"+std::string(names.str(name))+"' conflicts with variable discovered by where",graph_diagnostic(g));
                         newid=g.merge(old,newid,t.span,file);
                         declared[name]=newid;
                 }}
@@ -2047,10 +2413,24 @@ namespace gras {
                 for(NodeId a:ls)for(NodeId b:rs)g.add_edge({a,rel->tag,b});
             }
             NodeMap outs;
-            for(NodeId i:g.ids())for(auto a:g.nodes[i].names)if(a.theory==t.universe&&a.name!=NoName){
-                NameId root=root_name(a.name);
-                if(visible.count(root)||explicit_roots.count(root))outs.emplace(a.name,i);
-            }return {std::move(g),std::move(ins),std::move(outs)};
+            // `return all` returns the complete inferred graph.  Every live node is
+            // therefore part of the return subgraph, including parser-generated
+            // __tmp nodes.  Keep every non-literal alias in the owning universe; if
+            // a live node has no such alias, give it a stable temporary return name
+            // so it cannot disappear from type/graph displays or nested expansion.
+            for(NodeId i:g.ids()){
+                bool named=false;
+                for(const Alias& a:g.nodes[i].names)if(a.theory==t.universe&&a.name!=NoName&&!is_literal(names.str(a.name))){
+                    outs.emplace(a.name,i);
+                    named=true;
+                }
+                if(!named){
+                    NameId tmp=names.intern("__tmp_return_"+std::to_string(i));
+                    g.add_alias(i,t.universe,tmp);
+                    outs.emplace(tmp,i);
+                }
+            }
+            return {std::move(g),std::move(ins),std::move(outs)};
         }
 
         Graph g(names,registry);
@@ -2090,7 +2470,6 @@ namespace gras {
                     break;
                 }for(NodeId other:ids){
                     if(!g.has(target)||!g.has(other))continue;
-                    if(g.nodes[target].types!=g.nodes[other].types)throw Error(file,r.span,"call produced variable '"+std::string(names.str(nm))+"' with incompatible type",graph_diagnostic(g));
                     target=merge_maps(target,other,r.span);
                     if(outs.count(nm))outs[nm]=target;
                     if(ins.count(nm))ins[nm]=target;
@@ -2108,13 +2487,11 @@ namespace gras {
                             yes=true;
                             break;
                     }}if(yes)produced.push_back(i);
-                }std::vector<NodeId> compat;
-                for(NodeId i:produced)if(g.nodes[i].types==g.nodes[target].types)compat.push_back(i);
-                if(compat.size()==1){
-                    NodeId bound=merge_maps(target,compat[0],r.span);
+                }if(produced.size()==1){
+                    NodeId bound=merge_maps(target,produced[0],r.span);
                     if(outs.count(r.ret))outs[r.ret]=bound;
                     if(ins.count(r.ret))ins[r.ret]=bound;
-                }else if(!produced.empty())throw Error(file,r.span,"cannot place result '"+rr+"' into explicit return variable; structured result does not match",graph_diagnostic(g));
+                }else if(!produced.empty())throw Error(file,r.span,"cannot place result '"+rr+"' into explicit return variable; structured result is ambiguous",graph_diagnostic(g));
             }
         };
 
@@ -2245,6 +2622,24 @@ namespace gras {
             else if(rejected.size()==rejected_before)rejected.push_back({fn,cb.mismatch(expected,actual)});
             }
         }
+        // A declaration can produce multiple internal selection/specialization variants.
+        // Ambiguity is a source-level property: count each declaration once, not each
+        // matching internal variant.  If one declaration has several matching variants,
+        // the first deterministic variant is sufficient to apply that declaration.
+        if (!valid.empty()) {
+            std::vector<Valid> distinct;
+            std::set<std::tuple<std::string,uint32_t,uint32_t>> seen_declarations;
+            for (auto& candidate : valid) {
+                if (!candidate.fn) continue;
+                const Type& declaration = *candidate.fn;
+                std::string declaration_file = declaration.source_file.empty() ? file : declaration.source_file;
+                auto key = std::make_tuple(declaration_file, declaration.span.start.line, declaration.span.start.column);
+                if (!seen_declarations.insert(key).second) continue;
+                distinct.push_back(std::move(candidate));
+            }
+            valid = std::move(distinct);
+        }
+
         if (valid.empty()) {
             std::vector<std::string> boxes;
             for (size_t i = 0; i < rejected.size(); ++i) {
@@ -2259,7 +2654,28 @@ namespace gras {
             }
             throw Error(file,r.span,"cannot assign reduction result '"+std::string(names.str(r.ret))+"' from function '"+std::string(names.str(r.function))+"': none of its declared input graphs matches the selected call arguments.\n\n"+join(boxes,"\n\n"),graph_diagnostic(before));
         }
-        if (valid.size()>1) throw Error(file,r.span,"ambiguous reduction for result '"+std::string(names.str(r.ret))+"': "+std::to_string(valid.size())+" declarations accept the same selected graph",graph_diagnostic(before));
+        if (valid.size()>1) {
+            std::vector<RelatedLocation> related;
+            related.reserve(valid.size());
+            for (const auto& candidate : valid) {
+                if (!candidate.fn) continue;
+                const Type& declaration = *candidate.fn;
+                std::string declaration_file = declaration.source_file.empty() ? file : declaration.source_file;
+                related.push_back({
+                    std::string(names.str(declaration.full)),
+                    std::move(declaration_file),
+                    declaration.span
+                });
+            }
+            throw Error(
+                file,
+                r.span,
+                "ambiguous reduction for result '" + std::string(names.str(r.ret)) + "': "
+                    + std::to_string(valid.size()) + " declarations accept the same selected graph",
+                graph_diagnostic(before),
+                std::move(related)
+            );
+        }
         Valid v=std::move(valid.front());
         const Type&fn=*v.fn;
         Graph&templ=v.templ;
@@ -2284,7 +2700,14 @@ namespace gras {
             concrete[eid]=orig;
             matched_original.insert(orig);
         }std::set<Edge> input_edges;
-        for(auto&e:expected.edges)if(!names.str(e.tag).starts_with("!"))input_edges.insert({concrete[e.left],e.tag,concrete[e.right]});
+        for(const Edge& expected_edge:expected.edges)if(!names.str(expected_edge.tag).starts_with("!")){
+            NodeId left=concrete[expected_edge.left],right=concrete[expected_edge.right];
+            for(const Edge& actual_edge:g.edges){
+                if(actual_edge.left==left&&actual_edge.right==right&&edge_tag_matches(expected_edge.tag,actual_edge.tag)){
+                    input_edges.insert(actual_edge);
+                }
+            }
+        }
         std::unordered_map<NodeId,NodeId> eid_tid;
         std::unordered_map<NodeId,std::vector<NodeId>> eqgroups;
         for(auto[name,eid]:expected_map){
@@ -2380,6 +2803,9 @@ namespace gras {
             mapping[tid]=p.first;
             for(NodeId x:promoted_operands[tid])operand_keep.insert(resolve(x));
         }
+        for (auto [tid, gid] : mapping) {
+            if (g.has(gid) && tid < templ.nodes.size()) g.nodes[gid].types |= templ.nodes[tid].types;
+        }
         if(fn.return_all){
             for(auto[tid,gid]:mapping)if(g.has(gid))for(auto a:templ.nodes[tid].names)g.add_alias(gid,a.theory,a.name);
         }
@@ -2394,14 +2820,20 @@ namespace gras {
                 created[tid]=gid;
             }g.add_alias(gid,owner.universe,full);
             for (const Alias& alias : templ.nodes[tid].names) {
-                if (is_literal(names.str(alias.name))) {
-                    g.add_alias(gid, alias.theory, alias.name);
-                }
+                g.add_alias(gid, alias.theory, alias.name);
             }
             created[tid]=gid;
         }
         std::unordered_map<NodeId,NodeId> allmap=mapping;
         for(auto[k,vv]:created)allmap[k]=vv;
+        NameId semantic_call_alias = names.intern("Impl::\"" + std::string(names.str(fn.name)) + "\"");
+        for (const Edge& edge : templ.edges) {
+            if (edge.tag != returns || !output_ids.count(edge.right) || !call_name_id(templ, edge.left)) continue;
+            auto mapped_call = allmap.find(edge.left);
+            if (mapped_call != allmap.end() && g.has(mapped_call->second)) {
+                g.add_alias(mapped_call->second, fn.universe, semantic_call_alias);
+            }
+        }
         if(fn.return_all){
             for(NodeId tid:templ.ids()){
                 if(!allmap.count(tid)){
@@ -2457,9 +2889,24 @@ namespace gras {
         for(const Graph*src:{&a,&b}){
             std::unordered_map<NodeId,NodeId> m;
             for(NodeId old:src->ids()){
+                std::set<NameId> incoming_aliases;
+                for (const Alias& alias : src->nodes[old].names) {
+                    if (alias.name == NoName || is_literal(src->names->str(alias.name))) continue;
+                    incoming_aliases.insert(alias.name);
+                }
+                std::set<NodeId> existing;
+                for (NodeId candidate : g.ids()) {
+                    for (const Alias& alias : g.nodes[candidate].names) {
+                        if (alias.name != NoName && incoming_aliases.count(alias.name)) {
+                            existing.insert(candidate);
+                            break;
+                        }
+                    }
+                }
                 NodeId id=g.add_node(src->nodes[old].types);
-                g.nodes[id].names=src->nodes[old].names;
-                g.nodes[id].input_names=src->nodes[old].input_names;
+                for (const Alias& alias : src->nodes[old].names) g.add_alias(id, alias.theory, alias.name);
+                for (NameId input_name : src->nodes[old].input_names) g.add_input_name(id, input_name);
+                for (NodeId match : existing) if (g.has(match) && g.has(id)) id = g.merge(match, id);
                 m[old]=id;
             }for(auto&e:src->edges)if(src->has(e.left)&&src->has(e.right))g.add_edge({m[e.left],e.tag,m[e.right]});
         }return g;
@@ -2468,8 +2915,37 @@ namespace gras {
     static std::vector<Graph> build_variants(const std::string&file,Program&program,const Type&t,Interner&names,TypeRegistry&registry){
         std::unordered_map<NameId,std::vector<const Type*>> groups;
         for(auto&u:program.universes)for(auto&d:u.types)if(!d.union_template)groups[d.full].push_back(&d);
+        auto inferred_return_graph = [&](const Type& declaration, NameId prefix, NameId theory) {
+            Builder nested(file,program,names,registry);
+            nested.selected[declaration.full]=&declaration;
+            auto built=nested.build_function(declaration);
+            Graph out(names,registry);
+            std::set<NodeId> returned;
+            for(const auto& [name,id]:built.outputs){(void)name;if(built.graph.has(id))returned.insert(id);}
+            std::unordered_map<NodeId,NodeId> remap;
+            auto qualify_local=[&](NameId name){
+                if(prefix==NoName||names.str(prefix).empty())return name;
+                return names.intern(std::string(names.str(prefix))+"."+std::string(names.str(name)));
+            };
+            for(NodeId old_id:returned){
+                NodeId new_id=out.add_node(built.graph.nodes[old_id].types);
+                remap[old_id]=new_id;
+                for(const Alias& alias:built.graph.nodes[old_id].names){
+                    if(alias.name==NoName)continue;
+                    if(is_literal(names.str(alias.name)))out.add_alias(new_id,alias.theory,alias.name);
+                    else out.add_alias(new_id,alias.theory==declaration.universe?theory:alias.theory,qualify_local(alias.name));
+                }
+                for(NameId input_name:built.graph.nodes[old_id].input_names)out.add_input_name(new_id,qualify_local(input_name));
+            }
+            for(const Edge& edge:built.graph.edges){
+                auto left=remap.find(edge.left),right=remap.find(edge.right);
+                if(left!=remap.end()&&right!=remap.end())out.add_edge({left->second,edge.tag,right->second});
+            }
+            return out;
+        };
         std::function<std::vector<Graph>(const Type&,NameId,std::vector<NameId>)> expand;
         expand=[&](const Type&d,NameId prefix,std::vector<NameId> stack)->std::vector<Graph>{if(std::find(stack.begin(),stack.end(),d.full)!=stack.end())throw Error(file,d.span,"recursive expansion through "+std::string(names.str(d.full)));
+            if(d.function()&&d.return_all)return {inferred_return_graph(d,prefix,d.universe)};
             const auto&ss=d.function()?d.outputs:d.inputs;
             if(ss.size()==1){
                 if(auto*x=std::get_if<Field>(&ss[0]);x&&names.str(x->name)=="$"){
@@ -2587,7 +3063,10 @@ namespace gras {
         std::string nm=display==NoName?best_name(g,i):std::string(g.names->str(display));
         std::vector<std::string> ts;
         for(NameId t:g.types->names_for(g.nodes[i].types))ts.push_back(typefmt(g.names->str(t)));
-        std::cout<<std::string(indent,' ')<<cyan(nm)<<" "<<gray(":")<<" "<<join(ts,gray(" | "))<<"\n";
+        auto temps=temporary_alias_labels(g,i,nm);
+        std::string shown=nm;
+        if(!temps.empty())shown+=" ["+join(temps,", ")+"]";
+        std::cout<<std::string(indent,' ')<<cyan(shown)<<" "<<gray(":")<<" "<<join(ts,gray(" | "))<<"\n";
     }
     static void print_edge(const Graph&g,const Edge&e,int indent,const std::unordered_map<NodeId,NameId>&gn){
         auto show=[&](NodeId i){
@@ -4528,8 +5007,10 @@ namespace gras {
         std::ostringstream out;
         for (NodeId id : order) {
             std::string display = names[id] == NoName ? "#" + std::to_string(id) : std::string(g.names->str(names[id]));
-            out << "<div class=\"statement\"><span class=\"name\">" << html_escape(display)
-                << "</span> <span class=\"muted\">:</span> ";
+            out << "<div class=\"statement\"><span class=\"name\">" << html_escape(display) << "</span>";
+            auto temp_aliases=temporary_alias_labels(g,id,display);
+            if(!temp_aliases.empty())out << " <span class=\"muted\">[" << html_escape(join(temp_aliases, ", ")) << "]</span>";
+            out << " <span class=\"muted\">:</span> ";
             auto type_names = g.types->names_for(g.nodes[id].types);
             for (size_t i = 0; i < type_names.size(); ++i) {
                 if (i) out << " <span class=\"muted\">|</span> ";
@@ -4573,6 +5054,8 @@ namespace gras {
             std::vector<std::string> type_labels;
             for (NameId type_name : type_names) type_labels.emplace_back(g.names->str(type_name));
             std::string node_label = display;
+            auto temp_aliases=temporary_alias_labels(g,id,display);
+            if(!temp_aliases.empty())node_label += " [" + join(temp_aliases, ", ") + "]";
             if (!type_labels.empty()) node_label += " : " + join(type_labels, " | ");
             out << "{\"key\":" << json_escape(std::to_string(id))
                 << ",\"label\":" << json_escape(node_label)
@@ -4589,11 +5072,7 @@ namespace gras {
                 if (alias_name.empty()) continue;
                 if (!first_alias) out << ",";
                 first_alias = false;
-                if (alias.theory != NoName && alias_name.find("::") == std::string::npos) {
-                    out << json_escape(std::string(g.names->str(alias.theory)) + "::" + alias_name);
-                } else {
-                    out << json_escape(alias_name);
-                }
+                out << json_escape(alias_name);
             }
             out << "]}";
         }
@@ -4687,16 +5166,21 @@ namespace gras {
             size_t number_end = number_begin;
             while (number_end < message.size() && std::isdigit(static_cast<unsigned char>(message[number_end]))) ++number_end;
             uint32_t line = static_cast<uint32_t>(std::stoul(std::string(message.substr(number_begin, number_end - number_begin))));
+            uint32_t column = 1;
             size_t display_end = number_end;
             if (display_end < message.size() && message[display_end] == ':') {
                 size_t column_begin = display_end + 1;
                 size_t column_end = column_begin;
                 while (column_end < message.size() && std::isdigit(static_cast<unsigned char>(message[column_end]))) ++column_end;
-                if (column_end > column_begin) display_end = column_end;
+                if (column_end > column_begin) {
+                    column = static_cast<uint32_t>(std::stoul(std::string(message.substr(column_begin, column_end - column_begin))));
+                    display_end = column_end;
+                }
             }
             std::string display = chosen->relative + std::string(message.substr(number_begin - 1, display_end - (number_begin - 1)));
             out << "<button class=\"source-open inline-error-source\" data-file=\"" << html_escape(chosen->relative)
-                << "\" data-line=\"" << line << "\" title=\"Open " << html_escape(chosen->relative)
+                << "\" data-line=\"" << line << "\" data-column=\"" << column
+                << "\" title=\"Open " << html_escape(chosen->relative)
                 << "\">" << html_escape(display) << "</button>";
             pos = display_end;
         }
@@ -4705,14 +5189,32 @@ namespace gras {
 
     static std::string html_error(const Error& error, const std::unordered_map<std::string, std::string>& sources, const std::filesystem::path& workspace_root) {
         std::ostringstream out;
-        out << "<div class=\"error-card\"><strong>error</strong><pre class=\"error-message\">" << html_error_message(error.what(), sources, workspace_root) << "</pre>";
+        out << "<div class=\"error-card\"><strong>type error</strong><pre class=\"error-message\">" << html_error_message(error.what(), sources, workspace_root) << "</pre>";
         auto relative = workspace_relative_path(workspace_root, error.file);
         if (relative && std::filesystem::path(*relative).extension() == ".gs") {
             out << "<button class=\"source-open error-location\" data-file=\"" << html_escape(*relative)
-                << "\" data-line=\"" << error.span.start.line << "\" title=\"Open " << html_escape(*relative) << "\">"
+                << "\" data-line=\"" << error.span.start.line << "\" data-column=\"" << error.span.start.column
+                << "\" title=\"Open " << html_escape(*relative) << "\">"
                 << html_escape(*relative) << ":" << error.span.start.line << ":" << error.span.start.column << "</button>";
         } else {
             out << "<small>" << html_escape(error.file) << ":" << error.span.start.line << ":" << error.span.start.column << "</small>";
+        }
+        if (!error.related.empty()) {
+            out << "<div class=\"related-locations\">";
+            for (const RelatedLocation& location : error.related) {
+                auto related_relative = workspace_relative_path(workspace_root, location.file);
+                if (related_relative && std::filesystem::path(*related_relative).extension() == ".gs") {
+                    out << "<button class=\"source-open related-location\" data-file=\"" << html_escape(*related_relative)
+                        << "\" data-line=\"" << location.span.start.line << "\" data-column=\"" << location.span.start.column
+                        << "\" title=\"Open " << html_escape(*related_relative) << "\">"
+                        << html_escape(location.label) << " — " << html_escape(*related_relative) << ":"
+                        << location.span.start.line << ":" << location.span.start.column << "</button>";
+                } else {
+                    out << "<small class=\"related-location\">" << html_escape(location.label) << " — "
+                        << html_escape(location.file) << ":" << location.span.start.line << ":" << location.span.start.column << "</small>";
+                }
+            }
+            out << "</div>";
         }
 
         auto source = sources.find(error.file);
@@ -4839,12 +5341,6 @@ namespace gras {
             for (const Alias& alias : graph.nodes[id].names) {
                 if (alias.name == NoName) continue;
                 append_search_token(search, graph.names->str(alias.name));
-                if (alias.theory != NoName) {
-                    std::string_view alias_name = graph.names->str(alias.name);
-                    if (alias_name.find("::") == std::string_view::npos) {
-                        append_search_token(search, std::string(graph.names->str(alias.theory)) + "::" + std::string(alias_name));
-                    }
-                }
             }
         }
     }
@@ -4863,9 +5359,6 @@ namespace gras {
             if (alias.name == NoName) continue;
             std::string alias_name(graph.names->str(alias.name));
             add(alias_name);
-            if (alias.theory != NoName && alias_name.find("::") == std::string::npos) {
-                add(std::string(graph.names->str(alias.theory)) + "::" + alias_name);
-            }
         }
         return aliases;
     }
@@ -4878,6 +5371,7 @@ namespace gras {
         const std::filesystem::path& workspace_root,
         const std::unordered_map<std::string, std::string>& sources
     ) {
+        (void)sources;
         std::ostringstream out;
 
         for (auto& universe : program.universes) {
@@ -4957,8 +5451,11 @@ namespace gras {
                         << html_escape(join(aliases, "\n")) << "\"></label>";
                 }
                 out << "</div><button class=\"run-exec\">Run</button><div class=\"run-results\"></div></article>";
-            } catch (const Error& error) {
-                out << html_error(error, sources, workspace_root);
+            } catch (const Error&) {
+                // runtime_graph is still compile/type inference.  The affected local
+                // definition preview renders the structured type error; do not duplicate
+                // it as a global/run error.  Global run errors are reserved for execution.
+                continue;
             } catch (const std::exception& error) {
                 out << html_exception(error.what());
             }
@@ -5060,6 +5557,7 @@ namespace gras {
         Interner names;
         Loader loader(names);
         install_editor_buffers(loader, workspace_root, buffers);
+        try {
         Program program = loader.load(file, source);
         Resolver(file, program, names, loader.next_uid).resolve();
         TypeRegistry registry(names);
@@ -5075,7 +5573,8 @@ namespace gras {
         }
         if (!target) throw std::runtime_error("definition is no longer available; refresh inference");
         std::string type_file = target->source_file.empty() ? file : target->source_file;
-        Builder builder(type_file, program, names, registry);
+        std::vector<std::string> reduction_log;
+        Builder builder(type_file, program, names, registry, {}, graph_only ? nullptr : &reduction_log);
         if (target->function()) {
             auto built = builder.build_function(*target);
             auto input = builder.function_input(*target);
@@ -5101,7 +5600,38 @@ namespace gras {
                 if (has_output) return "{\"mode\":\"single\",\"panes\":[{\"title\":\"Return\",\"graph\":" + graph_data_json(built.graph, output_ids) + "}]}";
                 return "{\"mode\":\"single\",\"panes\":[]}";
             }
-            return "<div class=\"section-keyword\">input</div><div class=\"function-body\">" + html_graph(input.first, input_ids)
+            std::string reduction_html;
+            if (!reduction_log.empty()) {
+                std::ostringstream log_html;
+                log_html << "<details class=\"reduction-log\"><summary><strong>reduction log</strong> <span class=\"muted\">(" << reduction_log.size() << " events)</span></summary><div class=\"reduction-log-body\">";
+                auto fields = [](const std::string& row) {
+                    std::vector<std::string> out; size_t start = 0;
+                    for (;;) { size_t p = row.find('|', start); out.push_back(row.substr(start, p == std::string::npos ? p : p - start)); if (p == std::string::npos) break; start = p + 1; }
+                    return out;
+                };
+                bool step_open = false;
+                for (const std::string& row : reduction_log) {
+                    auto f = fields(row); if (f.empty()) continue;
+                    if (f[0] == "BEGIN") {
+                        if (step_open) log_html << "</section>";
+                        step_open = true;
+                        log_html << "<section class=\"reduction-step\"><div class=\"reduction-title\">" << html_escape(f.size()>1?f[1]:"reduction") << "</div>";
+                        if (f.size()>2 && !f[2].empty()) log_html << "<div class=\"reduction-note\">" << html_escape(f[2]) << "</div>";
+                    } else if (f[0] == "CANDIDATE" && f.size() >= 5) {
+                        log_html << "<div class=\"reduction-row candidate\"><strong>" << html_escape(f[1]) << "</strong><div class=\"reduction-metrics\"><span class=\"wanted\">wanted <b>" << html_escape(f[2]) << "</b></span><span class=\"unwanted\">unwanted <b>" << html_escape(f[3]) << "</b></span><span class=\"score\">score <b>" << html_escape(f[4]) << "</b></span></div></div>";
+                    } else if (f[0] == "APPLY" && f.size() >= 6) {
+                        log_html << "<div class=\"reduction-row selected\"><strong>apply #" << html_escape(f[1]) << " · " << html_escape(f[2]) << "</strong><div class=\"reduction-metrics\"><span class=\"wanted\">wanted <b>" << html_escape(f[3]) << "</b></span><span class=\"unwanted\">unwanted <b>" << html_escape(f[4]) << "</b></span><span class=\"score\">score <b>" << html_escape(f[5]) << "</b></span></div></div>";
+                    } else if (f[0] == "TRY" && f.size() >= 3) {
+                        log_html << "<div class=\"reduction-row selected\"><strong>apply #" << html_escape(f[1]) << " · " << html_escape(f[2]) << "</strong></div>";
+                    } else if (f[0] == "STOP" || f[0] == "SKIP" || f[0] == "DONE") {
+                        log_html << "<div class=\"reduction-status " << (f[0]=="STOP"?"stop":f[0]=="SKIP"?"skip":"done") << "\"><strong>" << html_escape(f[0]=="STOP"?"stop":f[0]=="SKIP"?"skip":"applied") << "</strong> " << html_escape(f.size()>1?f[1]:"") << "</div>";
+                    }
+                }
+                if (step_open) log_html << "</section>";
+                log_html << "</div></details>";
+                reduction_html = log_html.str();
+            }
+            return reduction_html + "<div class=\"section-keyword\">input</div><div class=\"function-body\">" + html_graph(input.first, input_ids)
                 + "</div><div class=\"section-keyword\">return</div><div class=\"function-body\">" + html_graph(built.graph, output_ids) + "</div>";
         }
         auto variants = build_variants(type_file, program, *target, names, registry);
@@ -5115,6 +5645,10 @@ namespace gras {
             body << html_graph(variants[i]);
         }
         return body.str();
+        } catch (const Error& error) {
+            if (graph_only) throw;
+            return html_error(error, loader.sources, workspace_root);
+        }
     }
 
     static std::string process_editor_source(
@@ -5212,20 +5746,40 @@ namespace gras {
                 if (it != input_values.end()) raw[names.intern(display)] = it->second;
             }
 
-            ExecResult result = execute_graph(graph, raw);
-            std::ostringstream json;
-            json << "{\"results\":[";
-            for (size_t i = 0; i < result.sinks.size(); ++i) {
-                if (i) json << ',';
-                NodeId sink = result.sinks[i];
-                json << "{\"name\":" << json_escape(best_name(graph, sink))
-                     << ",\"value\":" << json_escape(value_string(result.values.at(sink), *result.memory)) << '}';
+            // From this point on execution has actually started.  Only failures in this
+            // block are surfaced in the run/global error area.
+            try {
+                ExecResult result = execute_graph(graph, raw);
+                std::ostringstream json;
+                json << "{\"results\":[";
+                for (size_t i = 0; i < result.sinks.size(); ++i) {
+                    if (i) json << ',';
+                    NodeId sink = result.sinks[i];
+                    json << "{\"name\":" << json_escape(best_name(graph, sink))
+                         << ",\"value\":" << json_escape(value_string(result.values.at(sink), *result.memory)) << '}';
+                }
+                json << "]}";
+                return json.str();
+            } catch (const Error& error) {
+                std::ostringstream json;
+                json << "{\"runtime_error\":" << json_escape(error.what());
+                auto relative = workspace_relative_path(workspace_root, error.file);
+                if (relative && std::filesystem::path(*relative).extension() == ".gs") {
+                    json << ",\"error_file\":" << json_escape(*relative)
+                         << ",\"error_line\":" << error.span.start.line
+                         << ",\"error_column\":" << error.span.start.column;
+                }
+                json << "}";
+                return json.str();
+            } catch (const std::exception& error) {
+                return "{\"runtime_error\":" + json_escape(error.what()) + "}";
             }
-            json << "]}";
-            return json.str();
         } catch (const Error& error) {
+            // Parsing, resolving and graph construction are type/inference failures.
+            // Do not duplicate them in the global run-error area; inference renders the
+            // structured error on the relevant declaration.
             std::ostringstream json;
-            json << "{\"error\":" << json_escape(error.what());
+            json << "{\"type_error\":" << json_escape(error.what());
             auto relative = workspace_relative_path(workspace_root, error.file);
             if (relative && std::filesystem::path(*relative).extension() == ".gs") {
                 json << ",\"error_file\":" << json_escape(*relative)
@@ -5235,7 +5789,7 @@ namespace gras {
             json << "}";
             return json.str();
         } catch (const std::exception& error) {
-            return "{\"error\":" + json_escape(error.what()) + "}";
+            return "{\"server_error\":" + json_escape(error.what()) + "}";
         }
     }
 
@@ -5368,7 +5922,7 @@ header{position:relative;z-index:100;height:58px;display:flex;align-items:center
 .tab .dirty{color:var(--yellow);margin-left:4px}.save-state{color:var(--muted);font-size:12px;white-space:nowrap}
 main{display:grid;grid-template-columns:1fr 1fr;height:calc(100vh - 58px)}
 .editor,.inference{min-width:0;overflow:auto}.editor{position:relative;background:var(--panel2);border-right:1px solid var(--border)}
-.editwrap{position:absolute;inset:38px 0 0}.editwrap textarea,.editwrap pre{position:absolute;inset:0;margin:0;padding:20px 22px;border:0;overflow:auto;font:14px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4;white-space:pre}.editwrap textarea{z-index:2;resize:none;background:transparent;color:transparent;caret-color:white;-webkit-text-fill-color:transparent;outline:none}.editwrap textarea:disabled{cursor:default}.editwrap pre{z-index:1;pointer-events:none;color:var(--text)}
+.editwrap{position:absolute;inset:38px 0 0}.editwrap textarea,.editwrap pre{position:absolute;inset:0;margin:0;padding:20px 22px;border:0;overflow:auto;font:14px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:4;white-space:pre}.editwrap textarea{z-index:2;resize:none;background:transparent;color:transparent;caret-color:var(--text);outline:none}.editwrap textarea:focus{caret-color:var(--text)}.editwrap textarea::selection{background:#89ddff44;color:transparent}.editwrap textarea:disabled{cursor:default}.editwrap pre{z-index:1;pointer-events:none;color:var(--text)}
 .hl-k{color:var(--purple);font-weight:600}.hl-t{color:var(--green)}.hl-s{color:var(--yellow)}.hl-c{color:#596174}.hl-o{color:#f07178}
 .pane-title{position:sticky;top:0;z-index:3;height:38px;padding:10px 20px 7px;background:inherit;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;font-size:11px}
 .editor .pane-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.editor-search{position:absolute;z-index:8;right:14px;top:46px;display:flex;gap:6px;align-items:center;background:#151923;border:1px solid #46506b;border-radius:8px;padding:7px;box-shadow:0 8px 30px #0008}.editor-search[hidden]{display:none}.editor-search input{width:240px;background:#0f1218;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;outline:none}.editor-search .count{min-width:56px;color:var(--muted);font-size:11px;text-align:center}.inference{padding:0 24px 80px}.inference>.pane-title{margin:0 -24px 10px;background:var(--bg);display:flex;align-items:center;gap:12px}.inference>.pane-title span{white-space:nowrap}.panel-search{margin-left:auto;min-width:120px;width:min(320px,55%);background:#0f1218;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;text-transform:none;letter-spacing:0;outline:none}.panel-search:focus{border-color:#46506b}
@@ -5377,7 +5931,8 @@ details.definition-card{margin:5px 0;border:1px solid var(--border);border-radiu
 .definition-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0}.run-card>.definition-heading{margin:0 0 10px;align-items:flex-start}.definition-heading>span{min-width:0}.definition-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;min-width:0;max-width:72%}.source-open,.source-file{font-size:11px;line-height:1.35;text-transform:none;letter-spacing:0;white-space:nowrap;max-width:min(640px,62vw);overflow:hidden;text-overflow:ellipsis}.source-open{color:var(--cyan);background:#10141c;padding:3px 7px}.source-file{color:var(--muted)}.graph-btn{flex:0 0 auto;border:1px solid #384055;background:#10141c;color:var(--yellow);border-radius:6px;padding:2px 6px;line-height:1.3;cursor:pointer}.graph-btn:hover{background:#202635}.variant-heading{display:flex;align-items:center;justify-content:space-between;margin-top:8px}
 .graph-modal{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:28px;background:#080a0fd9}.graph-modal[hidden]{display:none}.graph-box{position:relative;width:min(1400px,96vw);height:min(860px,92vh);display:flex;flex-direction:column;background:var(--panel);border:1px solid #41495f;border-radius:12px;box-shadow:0 24px 80px #000d;overflow:hidden}.graph-header{height:48px;display:flex;align-items:center;gap:12px;padding:9px 12px;border-bottom:1px solid var(--border)}.graph-header .muted{flex:1}.graph-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:1px;min-height:0;flex:1;background:var(--border)}.graph-grid.split{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.graph-pane{position:relative;min-width:0;min-height:0;background:var(--panel2);display:flex;flex-direction:column}.graph-pane-title{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--purple);font-weight:700}.sigma-wrap{position:relative;min-height:300px;flex:1;overflow:hidden}.sigma-host{position:absolute;inset:0;z-index:1}.edge-overlay{position:absolute;inset:0;width:100%;height:100%;z-index:2;pointer-events:none}.node-label-overlay{position:absolute;inset:0;z-index:3;pointer-events:none}.node-label{position:absolute;transform:translate(-50%,-100%);margin-top:-14px;color:#f8fafc;font-weight:700;font-size:12px;text-shadow:0 1px 3px #000,0 0 5px #000;white-space:nowrap}.graph-tip{display:none;position:absolute;z-index:5;max-width:min(440px,75%);padding:9px 11px;background:#0b0e14f2;border:1px solid #465067;border-radius:8px;color:#f3f6fc;box-shadow:0 8px 28px #0008;pointer-events:none;white-space:pre-wrap;font-size:12px;line-height:1.5}.graph-tip.open{display:block}
 .keyword,.section-keyword{color:var(--purple);font-weight:700}.type{color:var(--green)}.literal{color:var(--yellow)}.qualifier,.muted,small{color:var(--muted)}.name{color:var(--cyan)}.relation{color:#f07178;font-weight:700}.section-keyword{margin-top:10px}.function-body{padding-left:10px}.empty{color:var(--muted)}
-.error-card{display:grid;gap:6px;margin:12px 0;padding:12px 14px;border:1px solid #ff6b7860;border-left:4px solid var(--red);border-radius:7px;background:#ff6b7810;color:#ffc2c7}.error-card strong{color:var(--red)}.error-card small{color:#a66f78}.error-message{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;color:inherit;background:transparent}.error-location{justify-self:start;border:0;background:transparent;padding:0;color:#a66f78;text-decoration:underline;cursor:pointer;font:inherit}.inline-error-source{display:inline;border:0;background:transparent;padding:0;color:var(--cyan);text-decoration:underline;cursor:pointer;font:inherit}.error-source{overflow:auto;background:#0d1017;padding:8px 10px;border-radius:5px;color:var(--text)}.error-source span{color:var(--muted)}.error-source b{color:var(--red)}
+.error-card{display:grid;gap:6px;margin:12px 0;padding:12px 14px;border:1px solid #ff6b7860;border-left:4px solid var(--red);border-radius:7px;background:#ff6b7810;color:#ffc2c7}.error-card strong{color:var(--red)}
+.reduction-log{margin:12px 0;border:1px solid #58a6ff66;border-left:4px solid #58a6ff;border-radius:7px;background:#58a6ff10;color:#b9dcff}.reduction-log>summary{padding:9px 12px;cursor:pointer;color:#79b8ff;list-style:none}.reduction-log>summary::-webkit-details-marker{display:none}.reduction-log>summary::before{content:"▸";display:inline-block;width:16px}.reduction-log[open]>summary::before{content:"▾"}.reduction-log-body{padding:0 12px 12px}.reduction-step{border-left:1px solid #58a6ff55;margin:4px 0 0 5px;padding:2px 0 4px 14px}.reduction-title{font-weight:800;color:#a8d5ff;margin:7px 0 3px}.reduction-note{color:#8fbfe9;margin:0 0 7px}.reduction-row{margin:5px 0;padding:6px 8px;border-radius:5px;background:#0d1624}.reduction-row.candidate{margin-left:14px;border-left:2px solid #607d9f}.reduction-row.selected{margin-left:14px;border-left:3px solid #58a6ff;background:#10243b}.reduction-fn,.reduction-row.selected>strong{color:#d5ebff}.reduction-target{margin:3px 0 0 14px;color:#91a9c2;overflow-wrap:anywhere}.reduction-metrics{display:flex;gap:12px;flex-wrap:wrap;margin:4px 0 0 14px;font-variant-numeric:tabular-nums}.reduction-metrics .wanted{color:#7ee787}.reduction-metrics .unwanted{color:#ff9b9b}.reduction-metrics .score{color:#79c0ff}.reduction-status{margin:5px 0 3px 14px;color:#91a9c2}.reduction-status.stop strong{color:#d2a8ff}.reduction-status.skip strong{color:#e3b341}.reduction-status.done strong{color:#7ee787}.error-card small{color:#a66f78}.error-message{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;color:inherit;background:transparent}.error-location{justify-self:start;border:0;background:transparent;padding:0;color:#a66f78;text-decoration:underline;cursor:pointer;font:inherit}.related-locations{display:grid;gap:3px;margin-top:2px}.related-location{justify-self:start;border:0;background:transparent;padding:0;color:var(--cyan);text-decoration:underline;cursor:pointer;font:inherit}.inline-error-source{display:inline;border:0;background:transparent;padding:0;color:var(--cyan);text-decoration:underline;cursor:pointer;font:inherit}.error-source{overflow:auto;background:#0d1017;padding:8px 10px;border-radius:5px;color:var(--text)}.error-source span{color:var(--muted)}.error-source b{color:var(--red)}
 .run-inputs{display:grid;gap:8px;margin:12px 0}.run-field{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:12px;align-items:center}.run-field input{min-width:0;width:100%;background:#0f1218;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;color:var(--text)}.run-exec{width:100%;margin:8px 0;background:var(--green);color:var(--bg);border:0;border-radius:7px;padding:7px 14px;font-weight:700;cursor:pointer}.run-results{margin-top:8px}
 .file-picker-backdrop{position:fixed;inset:0;z-index:20;background:#0008;display:flex;align-items:center;justify-content:center;padding:30px}.file-picker-backdrop[hidden]{display:none}.file-picker{width:min(780px,92vw);height:min(650px,82vh);display:flex;flex-direction:column;background:var(--panel);border:1px solid #41495f;border-radius:10px;box-shadow:0 20px 70px #000c;overflow:hidden}.file-picker-header{display:flex;align-items:center;gap:8px;padding:10px;border-bottom:1px solid var(--border)}.file-picker-path{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}.file-list{overflow:auto;padding:8px}.file-entry{display:flex;width:100%;align-items:center;gap:10px;background:transparent;color:var(--text);border:0;border-radius:6px;padding:7px 9px;text-align:left;cursor:pointer}.file-entry:hover{background:#232938}.file-entry .kind{width:18px;color:var(--muted)}.file-entry.directory .kind{color:var(--yellow)}
 @media(max-width:850px){main{grid-template-columns:1fr;height:auto}.editor{height:50vh;border-right:0;border-bottom:1px solid var(--border)}.inference{min-height:50vh}.save-state{display:none}.graph-grid.split{grid-template-columns:1fr;grid-template-rows:minmax(300px,1fr) minmax(300px,1fr)}.graph-box{height:94vh}}
@@ -5451,17 +6006,18 @@ let timer=null;
 let pickerDirectory='';
 let inferenceSerial=0;
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function scan(s){let types=new Set(),rels=new Set(),ts=[],i=0;while(i<s.length){if(s[i]=='\n'||s[i]==','){ts.push(['sep',s[i]]);i++;continue}if(/\s/.test(s[i])){i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);i=j<0?s.length:j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}ts.push(['str',s.slice(i,j)]);i=j;continue}let m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.]*(?:::[A-Za-z_][A-Za-z0-9_.]*)*/);if(m){let v=m[0],k=/^(universe|namespace|def|uses|return|where|reduce|all|close|do|run|import)$/.test(v)?'kw':'name';ts.push([k,v]);i+=v.length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m){ts.push(['rel',m[0]]);i+=m[0].length;continue}if(s[i]==':'||s[i]=='|'||s[i]=='('||s[i]==')'){ts.push([s[i],s[i]]);i++;continue}i++}for(let j=0;j+1<ts.length;j++)if(ts[j][0]=='kw'&&/^(type|namespace|universe)$/.test(ts[j][1])&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))types.add(ts[j+1][1]);let j=0,mode='top';while(j<ts.length){let t=ts[j];if(t[0]=='kw'){if(t[1]=='universe'||t[1]=='namespace'||t[1]=='type'){j+=2;mode=t[1]=='type'?'body':'top';continue}if(t[1]=='return'||t[1]=='where'){mode=t[1];j++;continue}if(t[1]=='run'||t[1]=='import'){mode='top';j+=2;continue}j++;continue}if(mode=='top'||t[0]!='name'){j++;continue}if(j+1<ts.length&&ts[j+1][0]==':'){j+=2;if(j<ts.length&&(ts[j][0]=='name'||ts[j][0]=='str'))j++;while(j+1<ts.length&&ts[j][0]=='|'&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))j+=2;continue}if(j+2<ts.length&&(ts[j+1][0]=='rel'||ts[j+1][0]=='name')&&(ts[j+2][0]=='name'||ts[j+2][0]=='str'||ts[j+2][0]=='kw')){let mid=ts[j+1],right=ts[j+2];if(!(mid[1]=='='&&right[0]=='kw'&&right[1]=='reduce'))rels.add(mid[1]);j+=3;continue}j++}return{types,rels}}
+function scan(s){let types=new Set(),rels=new Set(),ts=[],i=0;while(i<s.length){if(s[i]=='\n'||s[i]==','){ts.push(['sep',s[i]]);i++;continue}if(/\s/.test(s[i])){i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);i=j<0?s.length:j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}ts.push(['str',s.slice(i,j)]);i=j;continue}let m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_.]*(?:::[A-Za-z_][A-Za-z0-9_.]*)*/);if(m){let v=m[0],k=/^(universe|namespace|def|uses|return|where|reduce|goal|all|close|do|run|import)$/.test(v)?'kw':'name';ts.push([k,v]);i+=v.length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m){ts.push(['rel',m[0]]);i+=m[0].length;continue}if(s[i]==':'||s[i]=='|'||s[i]=='('||s[i]==')'){ts.push([s[i],s[i]]);i++;continue}i++}for(let j=0;j+1<ts.length;j++)if(ts[j][0]=='kw'&&/^(type|namespace|universe)$/.test(ts[j][1])&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))types.add(ts[j+1][1]);let j=0,mode='top';while(j<ts.length){let t=ts[j];if(t[0]=='kw'){if(t[1]=='universe'||t[1]=='namespace'||t[1]=='type'){j+=2;mode=t[1]=='type'?'body':'top';continue}if(t[1]=='return'||t[1]=='where'){mode=t[1];j++;continue}if(t[1]=='run'||t[1]=='import'){mode='top';j+=2;continue}j++;continue}if(mode=='top'||t[0]!='name'){j++;continue}if(j+1<ts.length&&ts[j+1][0]==':'){j+=2;if(j<ts.length&&(ts[j][0]=='name'||ts[j][0]=='str'))j++;while(j+1<ts.length&&ts[j][0]=='|'&&(ts[j+1][0]=='name'||ts[j+1][0]=='str'))j+=2;continue}if(j+2<ts.length&&(ts[j+1][0]=='rel'||ts[j+1][0]=='name')&&(ts[j+2][0]=='name'||ts[j+2][0]=='str'||ts[j+2][0]=='kw')){let mid=ts[j+1],right=ts[j+2];if(!(mid[1]=='='&&right[0]=='kw'&&right[1]=='reduce'))rels.add(mid[1]);j+=3;continue}j++}return{types,rels}}
 function isCallRelationAt(s,start,length){let depth=0,inString=false,escape=false;for(let k=0;k<start;k++){const c=s[k];if(inString){if(escape)escape=false;else if(c==='\\')escape=true;else if(c==='"')inString=false;continue;}if(c==='"'){inString=true;continue;}if(c==='/'&&s[k+1]==='/'){const nl=s.indexOf('\n',k+2);if(nl<0)return false;k=nl;continue;}if(c==='(')depth++;else if(c===')')depth=Math.max(0,depth-1);}if(depth<=0)return false;let p=start-1;while(p>=0&&/\s/.test(s[p]))p--;let n=start+length;while(n<s.length&&/\s/.test(s[n]))n++;if(p<0||n>=s.length)return false;const left=/[A-Za-z0-9_".)]/.test(s[p]);const right=/[A-Za-z_".(0-9]/.test(s[n]);return left&&right;}
-function highlightEditor(){let s=editor.value,o='',i=0,{types,rels}=scan(s);const keywords=new Set(['universe','namespace','def','uses','return','where','reduce','all','close','do','run','import']);while(i<s.length){if(s[i]=='('||s[i]==')'){o+='<span class="hl-s">'+s[i]+'</span>';i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);if(j<0)j=s.length;o+='<span class="hl-c">'+esc(s.slice(i,j))+'</span>';i=j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}o+='<span class="hl-s">'+esc(s.slice(i,j))+'</span>';i=j;continue}let m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);if(m){const word=m[0];if(keywords.has(word))o+='<span class="hl-k">'+word+'</span>';else if(types.has(word)||rels.has(word)||isCallRelationAt(s,i,word.length))o+='<span class="'+(types.has(word)?'hl-t':'hl-o')+'">'+esc(word)+'</span>';else o+=esc(word);i+=word.length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m&&rels.has(m[0])){o+='<span class="hl-o">'+esc(m[0])+'</span>';i+=m[0].length;continue}o+=esc(s[i++])}highlightCode.innerHTML=o+'\n'}
+function highlightEditor(){let s=editor.value,o='',i=0,{types,rels}=scan(s);const keywords=new Set(['universe','namespace','def','uses','return','where','reduce','goal','all','close','do','run','import']);while(i<s.length){if(s[i]=='('||s[i]==')'){o+='<span class="hl-s">'+s[i]+'</span>';i++;continue}if(s[i]=='/'&&s[i+1]=='/'){let j=s.indexOf('\n',i);if(j<0)j=s.length;o+='<span class="hl-c">'+esc(s.slice(i,j))+'</span>';i=j;continue}if(s[i]=='"'){let j=i+1;while(j<s.length){if(s[j]=='\\')j+=2;else if(s[j]=='"'){j++;break}else j++}o+='<span class="hl-s">'+esc(s.slice(i,j))+'</span>';i=j;continue}let m=s.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);if(m){const word=m[0];if(keywords.has(word))o+='<span class="hl-k">'+word+'</span>';else if(types.has(word)||rels.has(word)||isCallRelationAt(s,i,word.length))o+='<span class="'+(types.has(word)?'hl-t':'hl-o')+'">'+esc(word)+'</span>';else o+=esc(word);i+=word.length;continue}m=s.slice(i).match(/^[~=<>!+\-*\/%^&@#$?\\]+/);if(m&&rels.has(m[0])){o+='<span class="hl-o">'+esc(m[0])+'</span>';i+=m[0].length;continue}o+=esc(s[i++])}highlightCode.innerHTML=o+'\n'}
 function activeTab(){return activeIndex>=0?tabs[activeIndex]:null;}
 function rememberEditor(){const tab=activeTab();if(!tab)return;tab.source=editor.value;tab.scrollTop=editor.scrollTop;tab.scrollLeft=editor.scrollLeft;tab.selectionStart=editor.selectionStart;tab.selectionEnd=editor.selectionEnd;}
 function renderTabs(){tabsElement.innerHTML='';tabs.forEach((tab,index)=>{const wrap=document.createElement('div');wrap.className='tab'+(index===activeIndex?' active':'');const button=document.createElement('button');button.className='tab-button';button.title=tab.path;button.textContent=tab.path.split('/').pop()+(tab.dirty?' •':'');button.addEventListener('click',()=>activateTab(index));const close=document.createElement('button');close.className='tab-close';close.textContent='×';close.title='Close';close.addEventListener('click',event=>{event.stopPropagation();closeTab(index);});wrap.append(button,close);tabsElement.appendChild(wrap);});const current=activeTab();saveFileButton.disabled=!current;saveAsButton.disabled=!current;saveAllButton.disabled=!tabs.some(tab=>tab.dirty);activePathElement.textContent=current?current.path:'no file open';}
 function setEditorFromTab(tab){if(!tab){editor.value='';editor.disabled=true;highlightEditor();output.innerHTML='';return;}editor.disabled=false;editor.value=tab.source;highlightEditor();editor.scrollTop=tab.scrollTop||0;editor.scrollLeft=tab.scrollLeft||0;const start=Math.min(tab.selectionStart||0,editor.value.length),end=Math.min(tab.selectionEnd??start,editor.value.length);editor.setSelectionRange(start,end);}
-function activateTab(index,jumpLine=0){if(index<0||index>=tabs.length)return;rememberEditor();activeIndex=index;setEditorFromTab(tabs[index]);renderTabs();if(jumpLine>0)jumpToLine(jumpLine);infer();}
+function activateTab(index,jumpLine=0,jumpColumn=1){if(index<0||index>=tabs.length)return;rememberEditor();activeIndex=index;setEditorFromTab(tabs[index]);renderTabs();if(jumpLine>0)jumpToPosition(jumpLine,jumpColumn);infer();}
 function closeTab(index){if(index<0||index>=tabs.length)return;const tab=tabs[index];if(tab.dirty&&!confirm('Close '+tab.path+' without saving?'))return;rememberEditor();tabs.splice(index,1);if(!tabs.length)activeIndex=-1;else if(index<activeIndex)activeIndex--;else if(index===activeIndex)activeIndex=Math.min(index,tabs.length-1);setEditorFromTab(activeTab());renderTabs();if(activeTab())infer();else{inferenceSerial++;output.innerHTML='';}}
-function jumpToLine(line){const lines=editor.value.split('\n');let position=0;for(let i=1;i<line&&i<=lines.length;i++)position+=lines[i-1].length+1;editor.focus();editor.setSelectionRange(position,position);const lineHeight=parseFloat(getComputedStyle(editor).lineHeight)||23;editor.scrollTop=Math.max(0,(line-3)*lineHeight);rememberEditor();}
-async function openWorkspaceFile(path,line=0){let index=tabs.findIndex(tab=>tab.path===path);if(index>=0){activateTab(index,line);return;}try{const response=await fetch('/file?path='+encodeURIComponent(path));const data=await response.json();if(data.error)throw new Error(data.error);tabs.push({path:data.path,source:data.source,dirty:false,scrollTop:0,scrollLeft:0,selectionStart:0,selectionEnd:0});activateTab(tabs.length-1,line);}catch(error){saveState.textContent=String(error);}}
+function jumpToPosition(line,column=1){const lines=editor.value.split('\n');let position=0;for(let i=1;i<line&&i<=lines.length;i++)position+=lines[i-1].length+1;const text=lines[Math.max(0,Math.min(lines.length-1,line-1))]||'';position+=Math.min(text.length,Math.max(0,column-1));editor.focus();editor.setSelectionRange(position,position);const lineHeight=parseFloat(getComputedStyle(editor).lineHeight)||23;editor.scrollTop=Math.max(0,(line-3)*lineHeight);rememberEditor();}
+function jumpToLine(line){jumpToPosition(line,1);}
+async function openWorkspaceFile(path,line=0,column=1){let index=tabs.findIndex(tab=>tab.path===path);if(index>=0){activateTab(index,line,column);return;}try{const response=await fetch('/file?path='+encodeURIComponent(path));const data=await response.json();if(data.error)throw new Error(data.error);tabs.push({path:data.path,source:data.source,dirty:false,scrollTop:0,scrollLeft:0,selectionStart:0,selectionEnd:0});activateTab(tabs.length-1,line,column);}catch(error){saveState.textContent=String(error);}}
 async function saveTab(tab){const body=new URLSearchParams();body.set('path',tab.path);body.set('source',tab.source);const response=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body});const data=await response.json();if(data.error)throw new Error(data.error);tab.dirty=false;}
 async function saveActive(){rememberEditor();const tab=activeTab();if(!tab)return;if(tab.isNew){await saveAsActive();return;}try{saveState.textContent='saving…';await saveTab(tab);saveState.textContent='saved';renderTabs();setTimeout(()=>{if(saveState.textContent==='saved')saveState.textContent='';},1000);}catch(error){saveState.textContent=String(error);}}
 function unusedNewPath(){let n=1;while(true){const path=n===1?'untitled.gs':'untitled-'+n+'.gs';if(!tabs.some(tab=>tab.path===path))return path;n++;}}
@@ -5654,7 +6210,7 @@ editor.addEventListener('keydown',event=>{
 });
 newFileButton.addEventListener('click',()=>{closeMenus();newFile();});openFileButton.addEventListener('click',()=>{closeMenus();showFilePicker();});saveFileButton.addEventListener('click',()=>{closeMenus();saveActive();});saveAsButton.addEventListener('click',()=>{closeMenus();saveAsActive();});saveAllButton.addEventListener('click',()=>{closeMenus();saveEveryTab();});closePicker.addEventListener('click',()=>filePicker.hidden=true);filePicker.addEventListener('click',event=>{if(event.target===filePicker)filePicker.hidden=true;});fileUp.addEventListener('click',()=>{if(!pickerDirectory)return;const slash=pickerDirectory.lastIndexOf('/');loadPickerDirectory(slash<0?'':pickerDirectory.slice(0,slash));});panelSearch.addEventListener('input',applyPanelFilter);
 document.addEventListener('input',event=>{const input=event.target.closest&&event.target.closest('.run-card input[data-name]');if(input)cacheRunInput(input);});
-document.addEventListener('click',async event=>{const sourceButton=event.target.closest('.source-open');if(sourceButton){await openWorkspaceFile(sourceButton.dataset.file,Number(sourceButton.dataset.line||0));return;}const button=event.target.closest('.run-exec');if(!button)return;const tab=activeTab();if(!tab)return;rememberEditor();const card=button.closest('.run-card');const result=card.querySelector('.run-results');const body=new URLSearchParams();body.set('file',tab.path);body.set('source',tab.source);body.set('run',card.dataset.run);appendBuffers(body);card.querySelectorAll('input[data-name]').forEach(input=>{cacheRunInput(input);body.append('value.'+input.dataset.name,input.value);});button.disabled=true;try{const response=await fetch('/execute',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body});const data=await response.json();if(data.error){let location='';if(data.error_file){location='<button class="source-open error-location" data-file="'+esc(data.error_file)+'" data-line="'+Number(data.error_line||0)+'">'+esc(data.error_file+':'+(data.error_line||0)+':'+(data.error_column||0))+'</button>';}result.innerHTML='<div class="error-card"><strong>run error</strong><pre class="error-message">'+esc(data.error)+'</pre>'+location+'</div>';}else{result.innerHTML=data.results.map(item=>'<div class="statement"><span class="name">'+esc(item.name)+'</span> <span class="muted">=</span> '+esc(item.value)+'</div>').join('');}requestAnimationFrame(()=>requestAnimationFrame(()=>result.scrollIntoView({block:'end',behavior:'smooth'})));}catch(error){result.innerHTML='<div class="error-card"><strong>server error</strong><pre class="error-message">'+esc(error)+'</pre></div>';requestAnimationFrame(()=>result.scrollIntoView({block:'end',behavior:'smooth'}));}finally{button.disabled=false;}});
+document.addEventListener('click',async event=>{const sourceButton=event.target.closest('.source-open');if(sourceButton){await openWorkspaceFile(sourceButton.dataset.file,Number(sourceButton.dataset.line||0),Number(sourceButton.dataset.column||1));return;}const button=event.target.closest('.run-exec');if(!button)return;const tab=activeTab();if(!tab)return;rememberEditor();const card=button.closest('.run-card');const result=card.querySelector('.run-results');const body=new URLSearchParams();body.set('file',tab.path);body.set('source',tab.source);body.set('run',card.dataset.run);appendBuffers(body);card.querySelectorAll('input[data-name]').forEach(input=>{cacheRunInput(input);body.append('value.'+input.dataset.name,input.value);});button.disabled=true;try{const response=await fetch('/execute',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body});const data=await response.json();if(data.type_error){result.innerHTML='';await infer();return;}if(data.runtime_error){let location='';if(data.error_file){location='<button class="source-open error-location" data-file="'+esc(data.error_file)+'" data-line="'+Number(data.error_line||0)+'" data-column="'+Number(data.error_column||1)+'">'+esc(data.error_file+':'+(data.error_line||0)+':'+(data.error_column||0))+'</button>';}result.innerHTML='<div class="error-card"><strong>runtime error</strong><pre class="error-message">'+esc(data.runtime_error)+'</pre>'+location+'</div>';}else if(data.server_error){result.innerHTML='';saveState.textContent='server error: '+data.server_error;}else{result.innerHTML=data.results.map(item=>'<div class="statement"><span class="name">'+esc(item.name)+'</span> <span class="muted">=</span> '+esc(item.value)+'</div>').join('');}requestAnimationFrame(()=>requestAnimationFrame(()=>result.scrollIntoView({block:'end',behavior:'smooth'})));}catch(error){result.innerHTML='';saveState.textContent='server error: '+String(error);}finally{button.disabled=false;}});
 const initialFile=editor.dataset.initialFile;
 if(initialFile){tabs.push({path:initialFile,source:editor.value,dirty:false,scrollTop:0,scrollLeft:0,selectionStart:0,selectionEnd:0});activeIndex=0;editor.disabled=false;renderTabs();highlightEditor();infer();}else{editor.value='';editor.disabled=true;renderTabs();highlightEditor();showFilePicker();}
 </script>
@@ -5938,7 +6494,7 @@ document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!graphModal
                     "application/json; charset=utf-8"
                 );
             } catch (const std::exception& error) {
-                response.set_content("{\"error\":" + json_escape(error.what()) + "}", "application/json; charset=utf-8");
+                response.set_content("{\"server_error\":" + json_escape(error.what()) + "}", "application/json; charset=utf-8");
             }
         });
 
@@ -5970,7 +6526,15 @@ document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!graphModal
                 if(a<=line.size())out<<line.substr(0,a)<<ansi::RED_UL<<line.substr(a,b-a)<<ansi::RESET<<line.substr(b);
                 else out<<line;
                 out<<"\n "<<ansi::PURPLE<<"|"<<ansi::RESET<<" "<<std::string(a,' ')<<ansi::RED<<std::string(std::max<size_t>(1,b-a),'^')<<ansi::RESET;
-        }}if(!e.graph_context.empty())out<<"\n "<<ansi::PURPLE<<"|"<<ansi::RESET<<"\n"<<ansi::BOLD<<" graph context:"<<ansi::RESET<<"\n"<<e.graph_context;
+        }}
+        if(!e.related.empty()){
+            out<<"\n "<<ansi::PURPLE<<"|"<<ansi::RESET<<"\n"<<ansi::BOLD<<" related declarations:"<<ansi::RESET;
+            for(const RelatedLocation& location:e.related){
+                out<<"\n   "<<ansi::CYAN<<location.label<<ansi::RESET<<" -> "
+                   <<location.file<<":"<<location.span.start.line<<":"<<location.span.start.column;
+            }
+        }
+        if(!e.graph_context.empty())out<<"\n "<<ansi::PURPLE<<"|"<<ansi::RESET<<"\n"<<ansi::BOLD<<" graph context:"<<ansi::RESET<<"\n"<<e.graph_context;
         return out.str();
     }
 

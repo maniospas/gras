@@ -6,9 +6,8 @@ uses IO
 def main(path:string, converter:string) // try "stof" converter
 return all where
     lines = loadlines(path)
-    values = map(converter, lines)
+    values = fmap(converter, lines)
     reduce cat(converter followedby "")
     reduce get(values,0)
     
-
 run main

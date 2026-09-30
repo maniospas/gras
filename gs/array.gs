@@ -379,14 +379,11 @@ return (
     b arg1 call
 )
 
-// Map
 
 def fmap(fn:string, lines:sarray)
-return (
-    close,
-    call:"map",
-    result:farray,
-    call returns result,
-    fn arg0 call,
+return close
+    call:"map"
+    result:farray
+    call returns result
+    fn arg0 call
     lines arg1 call
-)

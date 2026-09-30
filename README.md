@@ -4,16 +4,22 @@
 
 **Author: Emmanouil Krasanakis**
 
-*Disclaimer: The code has mostly been written by ChatGPT-5.6 Sol, with manual design, review, refinement, and testing. This is a re-implementation of the most significant theory of my PhD some years after its conclusion in the form of a concrete language.*
+*Disclaimer: The code has mostly been written by ChatGPT-5.6 Sol, with manual design, review, refinement, and testing. This is a re-implementation of the most significant theory of my PhD (some years after its conclusion) in the form of a concrete language.*
 
 
 GraS is a language for proofs using labeled graph
 substitutions; variables are nodes, and named relations 
 are labeled directed edges. There are substitution rules 
-for "proving" programs, where the proof may also translate
-to creating a runnable pipeline. Do note that the proofs
-are logically consistent despite allowing abstract textual
-predicates in their definitions.
+for "proving" programs in algebraic systems that may be axiomatically
+weaker than math (e.g., may not necessarily interpret arithmetics,
+or may depend on abstract relations) but still rigorous.
+Proofs may also translate to runnable pipelines with logically consistent
+processes that make inferences in non-exact axiomatic systems.
+In particular, the language is *behaviorizeable*
+in that it can form proofs in underlying systems that are only
+partially specified through abstract terms. Those abstract terms
+can be string literals, relation labels, or unimplemented types declared
+only conceptually.
 
 ## 🚀 Quickstart
 
@@ -77,11 +83,15 @@ By the way inputs and outputs include both variables AND RELATIONS between
 them.
 
 We finally have a `where` clause that basically performs substitutions.
-Given that we previously used `all` GraS automatically creates temporary
-output variables for "hello" and " world!". What's the type of these variables?
+Given that we previously used `all`, GraS automatically creates temporary
+output variables for "hello" and " world!". If this automation was not enabled,
+all values would need to be wired onto named variables, for example per
+`tmp0="hello",tmp1=" world!",greeting=cat(tmp0 followedby tmp1)`
+
+What's the type of these variables, though?
 This is where the fun begins! They are **both** strings and string
 literals (a string literal is a type whose name is a string).
-Thus, running later interprets this situation as a known return value.
+This dual typing allows later runs to  interpret this situation as a known return value.
 When using GraS for proofs, you can even have types across different universes
 packed onto the same variable!!
 
@@ -93,13 +103,18 @@ And the actual thing that looks like a function call? That is actually a graph
 substitution mechanism that is performed on the one-edge graph `tmp0 --followedby--> tmp1`
 where *tmp0*,*tmp1* are the temporary variables corresponding to the strings,
 and  *followedby* is an arbitrary edge label, which is needed by the *cat* function.
-Actually, the call is kind of a syntax sugar for the following fully declarative schema.
-In that schema, we pass a bunch of nodes together with supplementary
-relations between them.
+Actually, the call is kind of a syntactic sugar for the following fully declarative schema.
+In that, we pass a bunch of nodes together with supplementary
+relations between them. Note that the assignment symbol corresponds to
+mathematical (rather than programmatic) equality by having the left and right
+side refer to the same value (values are also immutable).
 
 ```python
 def main()
-return all where
+return
+    tmp0: string
+    tmp1: string
+where
     tmp0 = "hello"
     tmp1 = " world!"
     reduce cat(tmp0, tmp1, tmp0 followedby tmp1)
@@ -234,7 +249,7 @@ return ret: nat
 where ret=p.x
 ```
 
-Returns are not alike the returns of most other languages 
+Returns are unlike those of most languages
 (including imperative and functional languages) in that they
 are essentially graph transformations. However, they can
 often feel like normal returns when using the `return all`
@@ -252,7 +267,7 @@ return all where
     r2 = add(y,z)
 ```
 
-To clarify on what the above snippet does, encountering `all`
+To clarify what the above snippet does, encountering `all`
 within a `return` asks the graph substitution function to 
 put on hold the rest of the return declaration, 
 parse a `where` that is now permitted to create new variables,
@@ -374,7 +389,7 @@ ret = mul(add(x,y), factor)
 ```
 
 By the way, you can add relations manually to be consumed immediately
-by the substitution's inputs. Here is an example, where notice how `addpairs`
+by the substitution's inputs. Below is an example. Notice how `addpairs`
 is called to add structure in arguments; the order does not matter unless
 a (partial) order is granted through appropriately-labeled relations.
 
@@ -401,24 +416,36 @@ In cases where `return all where` is used, all used inputs are reinstated as par
 of the output graph!
 
 
+### Cross-universe application
+
 Finally, `reduce all` automatically searches and performs all
 available function applications. This could be computationally
 unbounded in some scenarios, but safety checks will be added
-in the future.
+in the future. Do recall that variables may exhibit different
+types at the same time. Thus, the example defines a transformation
+between two different universes (*Impl* and *Field*) that
+converts natural numbers of implementations to numbers that can
+be involved in field arithmetic simplifications. This transformation
+is automatically applied, and then field optimizations are applied
+on the graph, eventually leading to... (drum roll)...
+*simplifying the overlaying implementation!*
 
 ```python
 import gs.impl
-import gs.implopt
+import gs.field
 uses Impl
-uses Implopt
 
-def main(x: nat, y: nat, z: nat)
-where
-    ret = sub(add(x,y,x followedby y), y) // x+y-y
-    reduce all merge_add
-    reduce all optimization_addsub
+def nat2num x:nat
+return x:Field::num
 
-run Main
+def main(x:nat, y:nat)
+return all where
+    reduce sub(add(x,y) followedby y)
+    reduce all nat2num
+    reduce all Field::merge_add
+    reduce all Field::optimization_addsub
+
+run main
 ```
 
 It has already been mentioned, but functions can merge nodes through the equality syntax 
@@ -428,6 +455,41 @@ between variables; always keep in mind that equality in GraS is a wiring operati
 def assert_equal(a: nat, b:nat)
 return(a: nat, b: nat)
 where a = b
+```
+
+You can customize the reduction scheme in two ways. First, replace `all` with a number
+to declare a maximum number of times the substitution should be performed. For example,
+`reduce 2 nat2num` applies the graph substitution function up to two times.
+
+Second, there is an optional mechanism for choosing between multiple substitution candidates
+subgraphs and functions. This mechanism promotes creating relations *Rgoal*
+where both endpoints belong to a goal universe, while reducing relations
+from other universes *Rother*. It does so through a (for now hard-coded) maximization of *Rgoal-0.1Rother*.
+
+State which universe should be preferred *before* the reduction with `goal universename`, like below.
+Do note the pattern of placing this in the `where` line so that it reads naturally and can be done away with.
+In this particular case, what should
+apply is deterministic and order-independent, but this criterion performs greedy optimization of the
+overall goal of having only members of the goal universe in the result. You may like thinking of reductions
+as a process of replacing "specifications" with "implementations" of the goal domain. Often, the goal
+domain will be *Impl*, though you may want to promote other domains for certain reductions.
+You may set a large upper bound to prevent those. Oh, by the way, look at the `|` used
+to indicate checked alternatives.
+
+```python
+import gs.impl
+import gs.field
+uses Impl
+
+def nat2num x:nat
+return x:Field::num
+
+def main(x:nat, y:nat)
+return all where goal Impl
+    reduce sub(add(x,y) followedby y)
+    reduce 1000 nat2num|Field::merge_add|Field::optimization_addsub
+
+run main
 ```
 
 ### Builtins
@@ -463,7 +525,7 @@ b arg1 call
 
 Use GraS to prove theorems involving one or multiple universes!
 Here is an example of a proof that all numbers are greater than
-zero in Peano arithmetics. When writing proofs, it is often
+zero in Peano arithmetic. When writing proofs, it is often
 convenient to just transfer all input nodes and relations to the
 output graph; this only adds information. Automate this by adding
 `close` in returns.
